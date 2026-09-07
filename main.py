@@ -81,6 +81,7 @@ from schemas import (
     AlertWebhookPayload,
     CanonicalAlert,
     EnrichedEvidence,
+    IocObservable,
     TriageResponse,
     TriageResult,
     TriageVerdict,
@@ -92,13 +93,56 @@ logger = logging.getLogger(__name__)
 app = FastAPI(title="SOC-3s triage")
 
 
-def _build_triage_result(verdict: TriageVerdict, evidence: EnrichedEvidence) -> TriageResult:
+def _build_ioc_observables(
+    hive_alert: dict | None, evidence: EnrichedEvidence
+) -> list[IocObservable]:
+    """The alert's `ioc: true` observables, each with the Cortex analyzer
+    output that ran against it (joined by observable value). v7
+    (2026-09-07, user-directed): replaces the flat `threat_intel` list on
+    `TriageResult` — analyzer rows now hang off their observable, and only
+    `ioc: true` rows are surfaced (hostname / endpoint-ip / other non-IOC
+    observables on the alert are dropped from the response). No OpenCTI
+    graph data — analyzer result only.
+
+    Reads `hive_alert.observables` directly (for `_id`/`dataType`/`tags`/
+    `ioc`, which `alert_builder._build_observables` collapses away) and
+    `evidence.canonical_alert.cortex_results` (already parsed from the same
+    `observables[].reports`, keyed by observable value)."""
+    cortex_by_value: dict[str, list] = {}
+    for cr in evidence.canonical_alert.cortex_results:
+        cortex_by_value.setdefault(cr.observable, []).append(cr)
+
+    out: list[IocObservable] = []
+    for obs in (hive_alert or {}).get("observables", []) or []:
+        if obs.get("ioc") is not True:
+            continue
+        value = str(obs.get("data") or "")
+        if not value:
+            continue
+        out.append(
+            IocObservable(
+                observable_id=str(obs.get("_id") or ""),
+                data_type=str(obs.get("dataType") or ""),
+                value=value,
+                tags=list(obs.get("tags") or []),
+                analyzer_results=cortex_by_value.get(value, []),
+            )
+        )
+    return out
+
+
+def _build_triage_result(
+    verdict: TriageVerdict, evidence: EnrichedEvidence, hive_alert: dict | None
+) -> TriageResult:
     """Replaces the deleted `nodes/score.py::priority_scoring` (v5,
     `newdesign.md` §5-§6) — no scoring math, just assembly. v6 (2026-09-06):
     takes one `verdict` object, not a `verdict`+`context` pair — everything
     (`priority_band`/`priority_reasoning`/`investigation_gaps`/
     `safety_gate_applied`/`correlation_decision`/`evidence_situation`) is
-    already on `verdict`, nothing left for this function to derive."""
+    already on `verdict`, nothing left for this function to derive. v7
+    (2026-09-07): also takes `hive_alert` for `_build_ioc_observables`; the
+    full `gathered_evidence` dump and flat `threat_intel` list are no longer
+    in the result."""
     started = time.monotonic()
     alert_id = evidence.canonical_alert.alert_id
 
@@ -111,12 +155,11 @@ def _build_triage_result(verdict: TriageVerdict, evidence: EnrichedEvidence) -> 
         likelihood=verdict.likelihood,
         impact_if_true=verdict.impact_if_true,
         evidence_citations=verdict.evidence_citations,
+        ioc_observables=_build_ioc_observables(hive_alert, evidence),
         actionable_observables=verdict.actionable_observables,
         correlation_reasoning=verdict.correlation_decision.reasoning,
         refined_mitre_mapping=verdict.refined_mitre_mapping,
         investigation_gaps=verdict.investigation_gaps,
-        threat_intel=evidence.canonical_alert.cortex_results,
-        gathered_evidence=evidence,
         triage_assessment=verdict,
         priority_band=verdict.priority_band,
         priority_reasoning=verdict.priority_reasoning,
@@ -207,14 +250,21 @@ async def run_pipeline(payload: AlertWebhookPayload) -> TriageResponse:
                 await _record_fp_feedback(alert, verdict)
 
             stage = "build_result"
-            result = _build_triage_result(verdict, evidence)
+            result = _build_triage_result(verdict, evidence, hive_alert)
 
             stage = "case_action"
             result.case_action = await case_action_mod.case_action(verdict, evidence)
             # Overwrite with the enriched, ID-populated version — the one
             # Stage 4 alone produced has no observable_id (case_action.py is
             # the only place a real TheHive id can be resolved/created).
+            # Also sync the copy nested in triage_assessment so the two don't
+            # disagree in the response.
             result.actionable_observables = result.case_action.actionable_observables_written
+            verdict.actionable_observables = result.case_action.actionable_observables_written
+            # Surface the case identity at the top level, next to alert_id.
+            result.case_id = result.case_action.case_id
+            result.case_number = result.case_action.case_number
+            result.is_new_case = result.case_action.is_new_case
 
             logger.info(
                 "triage completed: alert_id=%s priority_band=%s case_action.success=%s",

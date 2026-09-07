@@ -54,7 +54,7 @@ from schemas.evidence import (
     has_reliable_status,
 )
 from schemas.case_action import CaseActionResult
-from schemas.result import TriageResponse, TriageResult
+from schemas.result import IocObservable, TriageResponse, TriageResult
 from schemas.verdict import ActionableObservable, TriageVerdict
 
 __all__ = [
@@ -74,6 +74,7 @@ __all__ = [
     "HashBundle",
     "Host",
     "InvestigationProfile",
+    "IocObservable",
     "LogSource",
     "MitreCandidate",
     "MitreMapping",

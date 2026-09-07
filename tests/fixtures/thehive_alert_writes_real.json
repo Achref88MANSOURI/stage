@@ -1,0 +1,16 @@
+{
+  "_provenance": "REAL \u2014 TheHive 5.7.5 @ http://172.20.24.228:9000, alert ~46149872, captured live",
+  "comment_status": 201,
+  "comment_response": {
+    "_id": "~5410944",
+    "_type": "Comment",
+    "createdBy": "analyst@local.com",
+    "createdAt": 1788799932921,
+    "message": "soc3s regression-fixture capture \u2014 safe to delete",
+    "isEdited": false,
+    "extraData": {},
+    "external": false
+  },
+  "patch_status": 204,
+  "patch_body": ""
+}

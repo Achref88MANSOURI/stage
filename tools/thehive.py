@@ -29,18 +29,26 @@
     merge_alert_into_case           WRITE. Merges an alert into an existing
                                     case (`correlation_decision.merge_into_
                                     case_id`).
-    update_case                     WRITE. Partial case update — severity
-                                    and/or tags. Used for `merge_and_retier`.
+    update_case                     WRITE. Partial case update — severity,
+                                    tlp and/or tags. Used for
+                                    `merge_and_retier`.
     add_case_comment                WRITE. Appends a comment to a case —
                                     used to attach the full evidence/LLM
                                     summary on every merge (title/description
                                     overrides aren't accepted by the merge
                                     endpoint itself, unlike create).
+    update_alert                    WRITE. Partial ALERT update — severity /
+                                    tlp. Used on a `false_positive` verdict
+                                    (2026-09-07): the alert is annotated and
+                                    de-prioritised in place, never promoted.
+    add_alert_comment               WRITE. Appends a comment to an ALERT —
+                                    the triage narrative on a `false_positive`
+                                    verdict, since no case exists to carry it.
 
-    All four NEVER RAISE, same contract as every read function above, and are
-    LIVE-VERIFIED (2026-08-21) against the real instance — endpoints below
-    were discovered empirically, not from any TheHive doc, because none of
-    the guessed conventional paths were right on the first try:
+    All NEVER RAISE, same contract as every read function above, and are
+    LIVE-VERIFIED against the real instance — endpoints below were discovered
+    empirically, not from any TheHive doc, because none of the guessed
+    conventional paths were right on the first try:
 
         POST /api/v1/alert/{id}/case            create (NOT /promote — 404)
         POST /api/v1/alert/{id}/merge/{caseId}   merge  (confirmed via a real
@@ -55,6 +63,11 @@
                                                   created Comment object) —
                                                   NOT /api/v1/comment/case/{id}
                                                   (404)
+        PATCH /api/v1/alert/{id}                 alert update (204, no body)
+                                                  — verified 2026-09-07
+        POST /api/v1/alert/{id}/comment          alert comment (201, returns
+                                                  the created Comment) —
+                                                  verified 2026-09-07
 
     `create_case_from_alert`'s empty-body `POST .../case` call creates a case
     from the ALERT's own title/severity/tags (confirmed live: case ~4464672,
@@ -756,11 +769,14 @@ async def update_case(
     case_id: str,
     *,
     severity: int | None = None,
+    tlp: int | None = None,
     add_tags: list[str] | None = None,
     timeout: float | None = None,
 ) -> tuple[bool, Gap | None]:
     """Partial case update — only the fields passed are touched (TheHive's
-    own PATCH semantics, confirmed live). NEVER RAISES."""
+    own PATCH semantics, confirmed live). `severity` is 1..4, `tlp` is 0..4
+    (0 clear / 1 green / 2 amber / 3 amber+strict / 4 red — verified against
+    `/api/v1/describe/case` 2026-09-07). NEVER RAISES."""
     timeout = timeout if timeout is not None else config.STAGE_1_TOOL_TIMEOUT_THEHIVE
     started = time.monotonic()
 
@@ -776,6 +792,8 @@ async def update_case(
     body: dict[str, Any] = {}
     if severity is not None:
         body["severity"] = severity
+    if tlp is not None:
+        body["tlp"] = tlp
     if add_tags:
         body["addTags"] = add_tags
     if not body:
@@ -789,6 +807,52 @@ async def update_case(
         return False, gap(f"Timeout after {timeout}s updating case {case_id}")
     except Exception as exc:  # noqa: BLE001
         logger.warning("update_case failed for %s: %s", case_id, exc)
+        return False, gap(_describe_error(exc))
+    return True, None
+
+
+async def update_alert(
+    thehive_alert_id: str,
+    *,
+    severity: int | None = None,
+    tlp: int | None = None,
+    timeout: float | None = None,
+) -> tuple[bool, Gap | None]:
+    """Partial alert update — `PATCH /api/v1/alert/{id}`, returns 204 no
+    body. Used on a `false_positive` verdict to drop the alert to low
+    severity / clear TLP without promoting it to a case (2026-09-07,
+    user-directed). Same `severity` 1..4 / `tlp` 0..4 vocabulary as
+    `update_case` — verified against `/api/v1/describe/alert` and a real
+    `PATCH` (204) 2026-09-07. NEVER RAISES."""
+    timeout = timeout if timeout is not None else config.STAGE_6_TOOL_TIMEOUT_THEHIVE
+    started = time.monotonic()
+
+    def gap(reason: str) -> Gap:
+        return Gap(
+            source=SOURCE, tool="update_alert", reason=reason,
+            duration_ms=int((time.monotonic() - started) * 1000),
+        )
+
+    if not thehive_alert_id:
+        return False, gap("No thehive_alert_id supplied — nothing to update")
+
+    body: dict[str, Any] = {}
+    if severity is not None:
+        body["severity"] = severity
+    if tlp is not None:
+        body["tlp"] = tlp
+    if not body:
+        return False, gap("No fields to update were supplied")
+
+    try:
+        await asyncio.wait_for(
+            _write("PATCH", f"/api/v1/alert/{thehive_alert_id}", timeout, body),
+            timeout=timeout,
+        )
+    except asyncio.TimeoutError:
+        return False, gap(f"Timeout after {timeout}s updating alert {thehive_alert_id}")
+    except Exception as exc:  # noqa: BLE001
+        logger.warning("update_alert failed for %s: %s", thehive_alert_id, exc)
         return False, gap(_describe_error(exc))
     return True, None
 
@@ -818,6 +882,47 @@ async def add_case_comment(
         return False, gap(f"Timeout after {timeout}s commenting on case {case_id}")
     except Exception as exc:  # noqa: BLE001
         logger.warning("add_case_comment failed for %s: %s", case_id, exc)
+        return False, gap(_describe_error(exc))
+    return True, None
+
+
+async def add_alert_comment(
+    thehive_alert_id: str, comment: str, timeout: float | None = None
+) -> tuple[bool, Gap | None]:
+    """Append a comment to an ALERT (not a case) — `POST /api/v1/alert/{id}/
+    comment`, returns 201 with the created comment. Used on a
+    `false_positive` verdict to record the triage narrative on the alert
+    itself, since no case is created (2026-09-07, user-directed).
+    Live-verified: 201 + `{_id, _type: "Comment", message, ...}` against a
+    real alert 2026-09-07. NEVER RAISES."""
+    timeout = timeout if timeout is not None else config.STAGE_6_TOOL_TIMEOUT_THEHIVE
+    started = time.monotonic()
+
+    def gap(reason: str) -> Gap:
+        return Gap(
+            source=SOURCE, tool="add_alert_comment", reason=reason,
+            duration_ms=int((time.monotonic() - started) * 1000),
+        )
+
+    if not thehive_alert_id or not comment:
+        return False, gap(
+            f"Missing thehive_alert_id or empty comment (id={thehive_alert_id!r})"
+        )
+
+    try:
+        await asyncio.wait_for(
+            _write(
+                "POST",
+                f"/api/v1/alert/{thehive_alert_id}/comment",
+                timeout,
+                {"message": comment},
+            ),
+            timeout=timeout,
+        )
+    except asyncio.TimeoutError:
+        return False, gap(f"Timeout after {timeout}s commenting on alert {thehive_alert_id}")
+    except Exception as exc:  # noqa: BLE001
+        logger.warning("add_alert_comment failed for %s: %s", thehive_alert_id, exc)
         return False, gap(_describe_error(exc))
     return True, None
 

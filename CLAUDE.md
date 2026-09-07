@@ -1484,6 +1484,40 @@ so this fix's detection can't fire), and the one real duplicate it already produ
 `~291008` (`172.20.24.99` exists there twice) — flagged to the user, not cleaned up
 unprompted since deleting TheHive data needs explicit confirmation.
 
+### False-positive verdict → annotate the alert, never open a case, 2026-09-07
+
+**User-directed, a deliberate scoped reversal of the 2026-08-21 "every alert results in a
+case action, unconditionally" directive — for `verdict.verdict == "false_positive"` only.**
+`nodes/case_action.py` now has three branches, dispatched at the top of `_case_action`:
+
+1. `verdict == "false_positive"` → `_false_positive_alert_action`: NO create, NO merge. The
+   triage narrative (`_build_case_description`, unchanged) is posted as a **comment on the
+   alert** (`tools/thehive.py::add_alert_comment`, `POST /api/v1/alert/{id}/comment` → 201),
+   and the alert's severity/TLP are forced to the floor — **severity 1 (low), TLP 0 (clear),
+   regardless of the band the LLM assigned** (`update_alert`, `PATCH /api/v1/alert/{id}` →
+   204). FP feedback into the tracking DB is unchanged — still wired upstream in
+   `main.py::_record_fp_feedback`, called before `case_action`.
+2/3. otherwise unchanged: `correlation_decision.action` drives new-case vs merge.
+
+**Severity + TLP are both derived from `priority_band` on the case now** (`PRIORITY_TO_HIVE_
+SEVERITY` unchanged `{P1:4,P2:3,P3:2,P4:1,P5:1}`; new `PRIORITY_TO_HIVE_TLP`
+`{P1:4,P2:3,P3:2,P4:1,P5:0}` — TheHive TLP `0..4` = clear/green/amber/amber+strict/red,
+verified live against `/api/v1/describe/{case,alert}`). TheHive severity is only 1..4 so P4
+and P5 both map to `1`; TLP carries the full 5-band spread (P1 red … P5 clear) so the two
+stay distinguishable. `create_case_from_alert` now receives `tlp=`; `merge_and_retier`'s
+`update_case` bump now sets `tlp` too.
+
+**Live-verified** (TheHive 5.7.5 @ `172.20.24.228:9000`): both alert endpoints against a
+real alert — `POST .../comment` → 201 with a `Comment` object, `PATCH /alert/{id}` with
+`{severity,tlp}` → 204. Captured to `tests/fixtures/thehive_alert_writes_real.json`. Not yet
+verified end-to-end through a real `/triage` run that produces a `false_positive` verdict —
+the live Gemini backend hasn't emitted one on the available alerts; the FP branch is
+unit + mutation tested (`tests/test_case_action.py::TestFalsePositiveAlertAction`,
+`tests/test_main.py::TestFalsePositiveEndToEnd`) with the alert-write tools live-verified.
+
+`CaseActionResult` gained `action_taken` (`"new_case"`/`"merge"`/`"fp_alert"`) and `tlp`.
+`python3 -m pytest tests/ -q` — 412 passed.
+
 ---
 
 ## Deferred requirements — RESOLVED 2026-08-21 (Stage 5 build)

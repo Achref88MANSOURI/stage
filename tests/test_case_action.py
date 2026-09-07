@@ -269,7 +269,9 @@ class TestAddCaseComment:
 # ===========================================================================
 
 
-def make_evidence(*, thehive_alert_id: str = "~alert1") -> EnrichedEvidence:
+def make_evidence(
+    *, thehive_alert_id: str = "~alert1", open_cases: list[ShallowCase] | None = None
+) -> EnrichedEvidence:
     alert = CanonicalAlert(
         alert_id="~1",
         timestamp=datetime.now(timezone.utc),
@@ -281,6 +283,7 @@ def make_evidence(*, thehive_alert_id: str = "~alert1") -> EnrichedEvidence:
         canonical_alert=alert,
         rule_context=RuleContext(found=True, level="high", mitre_attack=["T1105"]),
         asset_context=AssetContext(found=True, hostname="win-test01", criticality="high"),
+        open_cases=open_cases or [],
         investigation_gaps=[Gap(source="opencti", reason="simulated gap", tool="opencti_observable_enrichment")],
     )
     return EnrichedEvidence(**raw.model_dump())
@@ -350,14 +353,15 @@ class TestBuildCaseContent:
         assert "Suspicious Invoke-WebRequest Execution" in title
         assert "win-test01" in title
 
-    def test_title_includes_alert_id(self):
-        """2026-09-07, user-directed: the alert_id (deterministic, from
-        CanonicalAlert, never LLM-sourced) must be in the case title too —
-        not just rule/host/priority."""
+    def test_title_excludes_alert_id(self):
+        """2026-09-07, user-directed reversal: the alert_id is NOT in the
+        case title — only priority/rule/host. It lives in the description
+        heading (asserted below) and in TriageResult.alert_id."""
         evidence = make_evidence()
         verdict = make_verdict()
         title = case_action_mod._build_case_title(verdict, evidence)
-        assert "~1" in title
+        assert "~1" not in title
+        assert "alert" not in title.lower()
 
     def test_description_includes_verdict_and_reasoning(self):
         evidence = make_evidence()
@@ -447,6 +451,12 @@ class TestCaseActionDispatch:
         assert result.case_id == "~new1"
         assert captured["called"] == "create"
         assert captured["severity"] == 4  # P1 -> hive severity 4
+        # v7 (2026-09-07): the Markdown written as the new case's
+        # description is echoed back on the result.
+        assert result.case_narrative == case_action_mod._build_case_description(
+            verdict, evidence
+        )
+        assert result.case_narrative
 
     def test_merge_action_calls_merge_and_comment(self, monkeypatch):
         captured = {}
@@ -467,7 +477,9 @@ class TestCaseActionDispatch:
         monkeypatch.setattr(th, "add_case_comment", fake_comment)
         monkeypatch.setattr(th, "update_case", should_not_update)
 
-        evidence = make_evidence()
+        evidence = make_evidence(
+            open_cases=[ShallowCase(case_id="~existing1", case_number=42)]
+        )
         verdict = make_verdict(
             action="merge", merge_into_case_id="~existing1", recommended_action="merge_quiet"
         )
@@ -477,9 +489,17 @@ class TestCaseActionDispatch:
         assert result.success is True
         assert result.is_new_case is False
         assert result.case_id == "~existing1"
+        # case_number is pulled from evidence.open_cases (no extra round trip)
+        assert result.case_number == 42
         assert result.comment_added is True
         assert captured["merge_case_id"] == "~existing1"
         assert captured["comment_case_id"] == "~existing1"
+        # v7 (2026-09-07): case_narrative is exactly the comment body posted
+        # to the merge target.
+        assert result.case_narrative == captured["comment_text"]
+        assert result.case_narrative == case_action_mod._build_case_description(
+            verdict, evidence
+        )
 
     def test_merge_and_retier_also_calls_update(self, monkeypatch):
         captured = {}
@@ -487,8 +507,9 @@ class TestCaseActionDispatch:
         async def fake_merge(alert_id, case_id, timeout=None):
             return True, None
 
-        async def fake_update(case_id, *, severity=None, add_tags=None, timeout=None):
+        async def fake_update(case_id, *, severity=None, tlp=None, add_tags=None, timeout=None):
             captured["update_severity"] = severity
+            captured["update_tlp"] = tlp
             return True, None
 
         async def fake_comment(case_id, comment, timeout=None):
@@ -510,6 +531,8 @@ class TestCaseActionDispatch:
 
         assert result.success is True
         assert captured["update_severity"] == 4  # P1 -> hive severity 4
+        assert captured["update_tlp"] == 4  # P1 -> TLP red
+        assert result.tlp == 4
 
     def test_null_merge_target_falls_back_to_create(self, monkeypatch):
         """Defensive path — action=='merge' but merge_into_case_id is None
@@ -563,6 +586,151 @@ class TestCaseActionDispatch:
 
         assert result.success is False
         assert "simulated merge failure" in result.error
+
+    def test_new_case_tlp_comes_from_priority_band(self, monkeypatch):
+        captured = {}
+
+        async def fake_create(alert_id, *, title, description, severity, tags=None, tlp=2, timeout=None):
+            captured["severity"] = severity
+            captured["tlp"] = tlp
+            return ShallowCase(case_id="~new1", case_number=1, severity=severity), None
+
+        monkeypatch.setattr(th, "create_case_from_alert", fake_create)
+
+        for band, exp_sev, exp_tlp in [
+            ("P1", 4, 4), ("P2", 3, 3), ("P3", 2, 2), ("P4", 1, 1), ("P5", 1, 0)
+        ]:
+            result = run(case_action_mod.case_action(
+                make_verdict(action="new", priority_band=band), make_evidence()
+            ))
+            assert captured["severity"] == exp_sev, band
+            assert captured["tlp"] == exp_tlp, band
+            assert result.tlp == exp_tlp, band
+            assert result.action_taken == "new_case"
+
+
+class TestFalsePositiveAlertAction:
+    """2026-09-07, user-directed: verdict == "false_positive" -> annotate the
+    alert (comment + severity/tlp floor), never a case."""
+
+    def _patch_no_case(self, monkeypatch):
+        async def boom(*a, **kw):
+            raise AssertionError("no case create/merge on a false positive")
+
+        monkeypatch.setattr(th, "create_case_from_alert", boom)
+        monkeypatch.setattr(th, "merge_alert_into_case", boom)
+
+    def test_fp_comments_alert_and_floors_severity_tlp(self, monkeypatch):
+        self._patch_no_case(monkeypatch)
+        captured = {}
+
+        async def fake_alert_comment(alert_id, message, timeout=None):
+            captured["comment_alert_id"] = alert_id
+            captured["comment"] = message
+            return True, None
+
+        async def fake_update_alert(alert_id, *, severity=None, tlp=None, timeout=None):
+            captured["update"] = (alert_id, severity, tlp)
+            return True, None
+
+        monkeypatch.setattr(th, "add_alert_comment", fake_alert_comment)
+        monkeypatch.setattr(th, "update_alert", fake_update_alert)
+
+        evidence = make_evidence(thehive_alert_id="~alertFP")
+        # priority_band is deliberately P1 — an FP is floored regardless
+        verdict = make_verdict(verdict="false_positive", priority_band="P1")
+
+        result = run(case_action_mod.case_action(verdict, evidence))
+
+        assert result.success is True
+        assert result.action_taken == "fp_alert"
+        assert result.is_new_case is False
+        assert result.case_id == ""
+        assert result.comment_added is True
+        assert result.severity == 1
+        assert result.tlp == 0
+        assert captured["comment_alert_id"] == "~alertFP"
+        assert captured["comment"] == case_action_mod._build_case_description(verdict, evidence)
+        assert result.case_narrative == captured["comment"]
+        assert captured["update"] == ("~alertFP", 1, 0)  # forced low / clear
+
+    def test_fp_comment_failure_flips_success_but_still_tries_severity(self, monkeypatch):
+        self._patch_no_case(monkeypatch)
+        calls = []
+
+        async def fail_comment(alert_id, message, timeout=None):
+            calls.append("comment")
+            return False, Gap(source="thehive", reason="comment 500", tool="add_alert_comment")
+
+        async def ok_update(alert_id, *, severity=None, tlp=None, timeout=None):
+            calls.append("update")
+            return True, None
+
+        monkeypatch.setattr(th, "add_alert_comment", fail_comment)
+        monkeypatch.setattr(th, "update_alert", ok_update)
+
+        result = run(case_action_mod.case_action(
+            make_verdict(verdict="false_positive"), make_evidence(thehive_alert_id="~a")
+        ))
+
+        assert result.success is False
+        assert "comment 500" in result.error
+        assert calls == ["comment", "update"]  # severity still attempted
+
+    def test_fp_severity_failure_is_recorded_but_does_not_flip_success(self, monkeypatch):
+        self._patch_no_case(monkeypatch)
+
+        async def ok_comment(alert_id, message, timeout=None):
+            return True, None
+
+        async def fail_update(alert_id, *, severity=None, tlp=None, timeout=None):
+            return False, Gap(source="thehive", reason="patch 403", tool="update_alert")
+
+        monkeypatch.setattr(th, "add_alert_comment", ok_comment)
+        monkeypatch.setattr(th, "update_alert", fail_update)
+
+        result = run(case_action_mod.case_action(
+            make_verdict(verdict="false_positive"), make_evidence(thehive_alert_id="~a")
+        ))
+
+        assert result.success is True  # the narrative landed — that's the bar
+        assert "patch 403" in result.error
+
+    def test_fp_without_thehive_alert_id_fails_cleanly(self, monkeypatch):
+        self._patch_no_case(monkeypatch)
+
+        async def boom(*a, **kw):
+            raise AssertionError("should not reach the write calls without an alert id")
+
+        monkeypatch.setattr(th, "add_alert_comment", boom)
+        monkeypatch.setattr(th, "update_alert", boom)
+
+        result = run(case_action_mod.case_action(
+            make_verdict(verdict="false_positive"), make_evidence(thehive_alert_id="")
+        ))
+
+        assert result.success is False
+        assert result.action_taken == "fp_alert"
+        assert "thehive_alert_id" in result.error
+
+    def test_against_real_captured_fp_run(self):
+        """REAL — `tests/fixtures/case_action_fp_live_run_real.json`: the real
+        `case_action` result from a live FP-path run against TheHive 5.7.5
+        (alert ~46149872, severity 3->1, tlp 2->0, narrative posted as an
+        alert comment), 2026-09-07."""
+        import json
+        from pathlib import Path
+
+        fx = json.loads(
+            (Path(__file__).parent / "fixtures" / "case_action_fp_live_run_real.json").read_text()
+        )
+        r = fx["case_action_result"]
+        assert r["action_taken"] == "fp_alert"
+        assert r["success"] is True and r["comment_added"] is True
+        assert r["case_id"] == "" and r["is_new_case"] is False
+        assert r["severity"] == 1 and r["tlp"] == 0
+        # the alert really changed on the backend
+        assert fx["alert_after"] == {"severity": 1, "tlp": 0, "comment_count": 2}
 
 
 # ===========================================================================

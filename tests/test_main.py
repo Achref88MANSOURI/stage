@@ -18,16 +18,21 @@ now takes `(verdict, evidence)`, not `(verdict, context, evidence)`.
 
 from __future__ import annotations
 
+import json
 from datetime import datetime, timezone
+from pathlib import Path
 
 import pytest
 from fastapi.testclient import TestClient
 
 import main
+
+FIXTURES = Path(__file__).parent / "fixtures"
 from schemas import (
     CanonicalAlert,
     CaseActionResult,
     CorrelationDecision,
+    CortexResult,
     EnrichedEvidence,
     EvidenceSituation,
     Gap,
@@ -127,6 +132,57 @@ class TestHappyPath:
         assert body["failed_stage"] is None
         assert body["result"]["alert_id"] == "~1"
         assert body["result"]["case_action"]["case_id"] == "~999"
+        # case identity hoisted to the top level, next to alert_id
+        assert body["result"]["case_id"] == "~999"
+        assert body["result"]["is_new_case"] is True
+
+    def test_response_shape_v7_trim(self, monkeypatch):
+        """v7 (2026-09-07): no raw evidence / flat cortex list in the
+        response; ioc:true observables carry their analyzer results, and the
+        case narrative comes back on case_action."""
+
+        alert = make_alert()
+        alert.cortex_results = [
+            CortexResult(observable="deadbeef", analyzer="VirusTotal", verdict=["malicious"])
+        ]
+
+        async def fake_get_full_alert(thehive_alert_id, timeout=None):
+            return {
+                "title": "t",
+                "observables": [
+                    {"_id": "~o1", "dataType": "hash", "data": "deadbeef",
+                     "tags": ["sha256"], "ioc": True},
+                    {"_id": "~o2", "dataType": "hostname", "data": "win-test",
+                     "tags": [], "ioc": False},
+                ],
+            }, None
+
+        async def fake_gather(a):
+            return RawEvidence(canonical_alert=alert)
+
+        async def fake_rag(raw):
+            return EnrichedEvidence(**raw.model_dump())
+
+        async def fake_case_action(verdict, evidence):
+            return CaseActionResult(
+                success=True, case_id="~999", case_number=12, is_new_case=True,
+                case_narrative="## Triage Summary — Alert `~1`",
+            )
+
+        monkeypatch.setattr(main.thehive, "get_full_alert_with_analysis", fake_get_full_alert)
+        monkeypatch.setattr(main.alert_builder, "build_canonical_alert", lambda *a, **kw: alert)
+        monkeypatch.setattr(main.gather_mod, "gather_evidence", fake_gather)
+        monkeypatch.setattr(main.rag_mod, "rag_enrichment", fake_rag)
+        monkeypatch.setattr(main.triage_mod, "single_stage_triage", lambda e: _async(make_verdict()))
+        monkeypatch.setattr(main.case_action_mod, "case_action", fake_case_action)
+
+        result = client.post("/triage", json=PAYLOAD).json()["result"]
+
+        assert "gathered_evidence" not in result
+        assert "threat_intel" not in result
+        assert [o["observable_id"] for o in result["ioc_observables"]] == ["~o1"]
+        assert result["ioc_observables"][0]["analyzer_results"][0]["analyzer"] == "VirusTotal"
+        assert result["case_action"]["case_narrative"] == "## Triage Summary — Alert `~1`"
 
     def test_degraded_hive_alert_fetch_does_not_block_success(self, monkeypatch):
         """A Gap from get_full_alert_with_analysis is logged, not fatal —
@@ -211,6 +267,64 @@ class TestFailurePosture:
         assert body["result"] is not None
         assert body["result"]["alert_id"] == "~1"
         assert body["result"]["case_action"] is None
+
+
+class TestV7ResponseAgainstRealCapturedResponse:
+    """REAL — the full `POST /triage` JSON response for TheHive alert
+    `~4739200` ([MEDIUM] Suspicious Schtasks Schedule Type With High
+    Privileges, desktop-8f2igk2), captured live 2026-09-07 against real
+    ES/TheHive/iTop/OpenCTI/Qdrant backends.
+
+    The Gemini triage call hit a real `429 Too Many Requests` at capture
+    time (the session had been probing it heavily), so `verdict` /
+    `triage_assessment` are the deterministic fallback — that does not
+    matter here: this fixture locks the response SHAPE, which is entirely
+    code-driven. `case_action` is the real `400 "Alert is already imported"`
+    (this alert was previously merged into case `~45391936`).
+
+    A separate real, non-fallback gemini-3.6-flash run (74.7s,
+    finish_reason=stop, verdict needs_review / merge_quiet / P3, MITRE
+    T1053.005) was verified live the same session but not kept as the
+    fixture since it predated the top-level `case_id` fields."""
+
+    def test_v7_shape_contract(self):
+        body = json.loads((FIXTURES / "main_triage_response_v7_real.json").read_text())
+        result = body["result"]
+
+        # the two removed fields are genuinely absent
+        assert "gathered_evidence" not in result
+        assert "threat_intel" not in result
+
+        # only ioc:true observables — all 4 real ones here are process-hash
+        # observables; the real alert also has a hostname + 3 endpoint-ip
+        # rows (ioc:false) that must NOT appear
+        obs = result["ioc_observables"]
+        assert len(obs) == 4
+        assert all(o["data_type"] == "hash" for o in obs)
+        assert all(o["observable_id"].startswith("~") for o in obs)
+
+        # analyzer rows are joined to the observable by value
+        for o in obs:
+            for a in o["analyzer_results"]:
+                assert a["observable"] == o["value"]
+        # 3 of the 4 had a VirusTotal report, the imphash-only one did not
+        assert sum(bool(o["analyzer_results"]) for o in obs) == 3
+
+        assert "case_narrative" in result["case_action"]
+
+    def test_case_identity_is_at_the_top_level(self):
+        """2026-09-07, user-directed: case id + number sit next to alert_id.
+        This real capture is a merge into case `~45391936` (#58) — surfaced
+        even though the merge itself failed (already-imported), because the
+        id/number come from `evidence.open_cases`, resolved before the call."""
+        result = json.loads(
+            (FIXTURES / "main_triage_response_v7_real.json").read_text()
+        )["result"]
+        assert result["case_id"] == "~45391936"
+        assert result["case_number"] == 58
+        assert result["is_new_case"] is False
+        assert result["case_id"] == result["case_action"]["case_id"]
+        assert result["case_number"] == result["case_action"]["case_number"]
 
 
 def _patch_happy_stages(monkeypatch, verdict: TriageVerdict, *, alert: CanonicalAlert | None = None):
@@ -333,6 +447,67 @@ class TestFPFeedbackLoop:
 
         assert resp.status_code == 200
         assert resp.json()["success"] is True
+
+
+class TestFalsePositiveEndToEnd:
+    """`/triage` with a false_positive verdict runs the REAL case_action
+    node (thehive tools mocked) — no case, alert annotated, fields hoisted."""
+
+    def test_fp_verdict_annotates_alert_no_case(self, monkeypatch):
+        from tools import thehive as th_mod
+
+        calls = {}
+
+        async def fake_record(*a, **kw):
+            calls["fp_feedback"] = True
+            return True, None
+
+        async def no_case(*a, **kw):
+            raise AssertionError("no case create/merge for a false positive")
+
+        async def fake_alert_comment(alert_id, message, timeout=None):
+            calls["comment"] = alert_id
+            return True, None
+
+        async def fake_update_alert(alert_id, *, severity=None, tlp=None, timeout=None):
+            calls["update"] = (alert_id, severity, tlp)
+            return True, None
+
+        monkeypatch.setattr(main.fp_tracking, "record_triage_outcome", fake_record)
+        monkeypatch.setattr(th_mod, "create_case_from_alert", no_case)
+        monkeypatch.setattr(th_mod, "merge_alert_into_case", no_case)
+        monkeypatch.setattr(th_mod, "add_alert_comment", fake_alert_comment)
+        monkeypatch.setattr(th_mod, "update_alert", fake_update_alert)
+
+        alert = make_alert()
+        alert.thehive_alert_id = "~alertFP"
+
+        async def fake_gather(a):
+            return RawEvidence(canonical_alert=alert)
+
+        async def fake_rag(raw):
+            return EnrichedEvidence(**raw.model_dump())
+
+        monkeypatch.setattr(main.alert_builder, "build_canonical_alert", lambda *a, **kw: alert)
+        monkeypatch.setattr(main.gather_mod, "gather_evidence", fake_gather)
+        monkeypatch.setattr(main.rag_mod, "rag_enrichment", fake_rag)
+        monkeypatch.setattr(
+            main.triage_mod, "single_stage_triage",
+            lambda e: _async(make_verdict(verdict="false_positive", priority_band="P1")),
+        )
+        # case_action is NOT patched — the real node runs.
+
+        result = client.post("/triage", json=PAYLOAD).json()["result"]
+
+        assert calls["fp_feedback"] is True
+        assert calls["comment"] == "~alertFP"
+        assert calls["update"] == ("~alertFP", 1, 0)  # forced low / clear
+        assert result["verdict"] == "false_positive"
+        assert result["case_id"] == ""
+        assert result["is_new_case"] is False
+        assert result["case_action"]["action_taken"] == "fp_alert"
+        assert result["case_action"]["severity"] == 1
+        assert result["case_action"]["tlp"] == 0
 
 
 class TestHealth:

@@ -16,10 +16,12 @@ from datetime import datetime, timezone
 from schemas import (
     CanonicalAlert,
     CorrelationDecision,
+    CortexResult,
     EnrichedEvidence,
     EvidenceSituation,
     EvidenceSource,
     Host,
+    IocObservable,
     RawEvidence,
     Rule,
     TriageResult,
@@ -87,7 +89,7 @@ class TestTriageResultHasNoPriorityScore:
 
 class TestTriageResultPriorityFieldsComeFromVerdict:
     def test_priority_band_and_reasoning(self):
-        result = main._build_triage_result(make_verdict(), make_evidence())
+        result = main._build_triage_result(make_verdict(), make_evidence(), None)
         assert result.priority_band == "P2"
         assert result.priority_reasoning == "P2 because confirmed malicious, no active spread"
 
@@ -100,18 +102,18 @@ class TestTriageResultPriorityFieldsComeFromVerdict:
         investigation_gaps field anywhere in the pipeline now."""
         verdict = make_verdict(investigation_gaps=["the real consolidated gap"])
 
-        result = main._build_triage_result(verdict, make_evidence())
+        result = main._build_triage_result(verdict, make_evidence(), None)
 
         assert result.investigation_gaps == ["the real consolidated gap"]
 
     def test_safety_gate_applied_is_copied_through(self):
         result = main._build_triage_result(
-            make_verdict(safety_gate_applied=True), make_evidence()
+            make_verdict(safety_gate_applied=True), make_evidence(), None
         )
         assert result.safety_gate_applied is True
 
     def test_evidence_situation_comes_from_verdict(self):
-        result = main._build_triage_result(make_verdict(), make_evidence())
+        result = main._build_triage_result(make_verdict(), make_evidence(), None)
         assert result.evidence_situation.overall_evidence_reliability == "medium"
         assert result.evidence_situation.analyst_must_verify == ["Verify asset criticality manually"]
 
@@ -124,7 +126,7 @@ class TestTriageResultBuilderIsPureNoMath:
 
     def test_result_fields_are_all_traceable_to_verdict(self):
         verdict = make_verdict()
-        result = main._build_triage_result(verdict, make_evidence())
+        result = main._build_triage_result(verdict, make_evidence(), None)
 
         assert result.verdict == verdict.verdict
         assert result.recommended_action == verdict.recommended_action
@@ -135,3 +137,110 @@ class TestTriageResultBuilderIsPureNoMath:
         assert result.correlation_reasoning == verdict.correlation_decision.reasoning
         assert result.refined_mitre_mapping == verdict.refined_mitre_mapping
         assert result.triage_assessment == verdict
+
+
+class TestTriageResultV7Trim:
+    """2026-09-07, user-directed: the response no longer carries the raw
+    evidence dump or the flat Cortex list."""
+
+    def test_gathered_evidence_field_is_gone(self):
+        assert "gathered_evidence" not in TriageResult.model_fields
+
+    def test_flat_threat_intel_field_is_gone(self):
+        assert "threat_intel" not in TriageResult.model_fields
+
+    def test_ioc_observables_field_exists(self):
+        assert "ioc_observables" in TriageResult.model_fields
+
+    def test_case_identity_fields_are_top_level(self):
+        """2026-09-07, user-directed: the case id (new or merge target) sits
+        next to alert_id, not only nested under case_action."""
+        for f in ("case_id", "case_number", "is_new_case"):
+            assert f in TriageResult.model_fields
+
+
+def _evidence_with_cortex(*cortex: CortexResult) -> EnrichedEvidence:
+    alert = make_alert()
+    alert.cortex_results = list(cortex)
+    raw = RawEvidence(canonical_alert=alert)
+    return EnrichedEvidence(**raw.model_dump())
+
+
+class TestIocObservables:
+    """`main._build_ioc_observables` — only `ioc: true` observables, each
+    joined to its Cortex analyzer rows by observable value. No OpenCTI."""
+
+    HIVE_ALERT = {
+        "observables": [
+            {
+                "_id": "~obs-hash",
+                "dataType": "hash",
+                "data": "8dd1ebb0deadbeef",
+                "tags": ["sha256", "process:cmd.exe"],
+                "ioc": True,
+            },
+            {
+                "_id": "~obs-host",
+                "dataType": "hostname",
+                "data": "desktop-8f2igk2",
+                "tags": [],
+                "ioc": False,
+            },
+            {
+                "_id": "~obs-ip",
+                "dataType": "ip",
+                "data": "203.0.113.9",
+                "tags": ["field:destination.ip"],
+                "ioc": True,
+            },
+        ]
+    }
+
+    def _build(self):
+        vt = CortexResult(
+            observable="8dd1ebb0deadbeef",
+            type="hash",
+            verdict=["malicious"],
+            analyzer="VirusTotal_GetReport_3_1",
+        )
+        evidence = _evidence_with_cortex(vt)
+        return main._build_triage_result(make_verdict(), evidence, self.HIVE_ALERT)
+
+    def test_only_ioc_true_observables_are_surfaced(self):
+        result = self._build()
+        ids = {o.observable_id for o in result.ioc_observables}
+        assert ids == {"~obs-hash", "~obs-ip"}  # the hostname (ioc: false) is dropped
+
+    def test_observable_metadata_is_carried(self):
+        result = self._build()
+        by_id = {o.observable_id: o for o in result.ioc_observables}
+        assert by_id["~obs-hash"].data_type == "hash"
+        assert by_id["~obs-hash"].value == "8dd1ebb0deadbeef"
+        assert by_id["~obs-hash"].tags == ["sha256", "process:cmd.exe"]
+
+    def test_analyzer_results_joined_by_value(self):
+        result = self._build()
+        by_id = {o.observable_id: o for o in result.ioc_observables}
+        assert [a.analyzer for a in by_id["~obs-hash"].analyzer_results] == [
+            "VirusTotal_GetReport_3_1"
+        ]
+        # the ip is ioc: true but no analyzer ran against it
+        assert by_id["~obs-ip"].analyzer_results == []
+
+    def test_no_hive_alert_yields_empty_list(self):
+        result = main._build_triage_result(make_verdict(), _evidence_with_cortex(), None)
+        assert result.ioc_observables == []
+
+    def test_mutation_ioc_filter(self):
+        """If the `ioc is not True` guard were dropped, the hostname row
+        would leak in — this asserts it doesn't."""
+        result = self._build()
+        assert all(o.data_type != "hostname" for o in result.ioc_observables)
+
+    def test_mutation_value_join_key(self):
+        """A Cortex row whose observable value matches nothing on the alert
+        must not attach to an unrelated observable."""
+        stray = CortexResult(observable="not-on-this-alert", analyzer="X")
+        evidence = _evidence_with_cortex(stray)
+        result = main._build_triage_result(make_verdict(), evidence, self.HIVE_ALERT)
+        assert all(o.analyzer_results == [] for o in result.ioc_observables)

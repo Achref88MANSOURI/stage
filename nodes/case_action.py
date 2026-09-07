@@ -1,19 +1,35 @@
-"""`case_action` — creates or merges a TheHive case from the triage result.
+"""`case_action` — creates a case, merges into one, or (on a false positive)
+annotates the alert in place.
 
 NOT part of architecture v4's six stages. A deliberate deviation from §1/§3's
 "read-only, n8n owns case mutation" design, user-directed 2026-08-21 — see
 CLAUDE.md's "Case action" entry for the full record of that decision. This is
 the first node in the pipeline with real, externally-visible side effects.
 
-Driven ONLY by `verdict.correlation_decision.action` — per the user's explicit
-directive, every alert results in either a new case or a merge,
-unconditionally. There is no `needs_review`/`close_fp` hold-off here:
-`TriageVerdict`'s richer fields (verdict, recommended_action, reasoning,
-summary, citations) become CONTENT written into the case, never a gate on
-whether to act. `recommended_action == "merge_and_retier"` is the one place
-those richer fields DO change behavior — it triggers an extra severity-bump
-call on top of the merge, since TheHive's merge endpoint doesn't accept field
-overrides in the same call (see `tools/thehive.py`'s module docstring).
+**Three branches:**
+
+- `verdict.verdict == "false_positive"` (2026-09-07, user-directed — a
+  scoped reversal of the "every alert -> case action, unconditionally"
+  directive below, for FP only): NO case is created or merged. The triage
+  narrative is posted as a comment on the ALERT, and the alert's severity /
+  TLP are forced to the floor (low / clear). FP feedback into the tracking
+  DB is wired separately, upstream, in `main.py::_record_fp_feedback`.
+  Handled by `_false_positive_alert_action`.
+
+- otherwise, driven ONLY by `verdict.correlation_decision.action` — every
+  non-FP alert results in either a new case or a merge, unconditionally.
+  There is no `needs_review` hold-off: `TriageVerdict`'s richer fields
+  (recommended_action, reasoning, summary, citations) become CONTENT written
+  into the case, never a gate on whether to act. `recommended_action ==
+  "merge_and_retier"` is the one place those richer fields DO change
+  behavior — it triggers an extra severity/TLP-bump call on top of the
+  merge, since TheHive's merge endpoint doesn't accept field overrides in
+  the same call (see `tools/thehive.py`'s module docstring).
+
+Case severity (1..4) and TLP (0..4) are both derived from
+`verdict.priority_band` — `PRIORITY_TO_HIVE_SEVERITY` / `PRIORITY_TO_HIVE_TLP`.
+Severity can't distinguish P4 from P5 (both `1`/low); TLP carries the full
+5-band spread (P1 red .. P5 clear).
 
 This node makes 1-3 real HTTP calls to a live TheHive instance and needs its
 own timeout/Gap handling. `TriageResult.case_action` is `None` until a caller
@@ -76,8 +92,27 @@ logger = logging.getLogger(__name__)
 
 # Moved from the deleted scoring_config.py (v5 redesign, `newdesign.md` §7) —
 # same mapping, unchanged. Keyed on TriageVerdict.priority_band now, not the
-# old PriorityScore.final_priority.
+# old PriorityScore.final_priority. TheHive severity is 1..4 only, so P4 and
+# P5 both collapse to 1 (low) — the two are kept distinct by TLP below
+# (user-directed 2026-09-07: "P5 and P4 both to 1, but with different color").
 PRIORITY_TO_HIVE_SEVERITY: dict[str, int] = {"P1": 4, "P2": 3, "P3": 2, "P4": 1, "P5": 1}
+
+# priority_band -> TheHive TLP (0..4 = clear / green / amber / amber+strict /
+# red — verified live against /api/v1/describe/{case,alert} 2026-09-07).
+# User-directed 2026-09-07: spread all 5 bands across all 5 TLP values so the
+# priority survives even where severity can't distinguish P4 from P5.
+# Applied to the case on create (and on a merge_and_retier bump); the FP
+# branch below forces the alert to CLEAR regardless.
+PRIORITY_TO_HIVE_TLP: dict[str, int] = {"P1": 4, "P2": 3, "P3": 2, "P4": 1, "P5": 0}
+_DEFAULT_TLP = 2  # amber — used only if an unknown band string ever appears
+
+# A `false_positive` verdict never opens a case (user-directed 2026-09-07,
+# a deliberate scoped reversal of the 2026-08-21 "every alert -> case action
+# unconditionally" directive — see CLAUDE.md). The alert is annotated in
+# place and dropped to the floor: low severity, clear TLP, regardless of the
+# band the LLM assigned.
+FP_ALERT_SEVERITY = 1  # low
+FP_ALERT_TLP = 0  # clear
 
 # ActionableObservable.observable_type -> TheHive dataType. Distinct from
 # tools/thehive.py's old (now-retired) _BUCKET_TO_DATATYPE: these are the
@@ -240,18 +275,16 @@ def _build_case_title(verdict: TriageVerdict, evidence: EnrichedEvidence) -> str
     replacing the old score-bearing title (`priority_score.priority` /
     `.score`, both gone with `PriorityScore`).
 
-    2026-09-07, user-directed: the alert_id is appended — deterministic,
-    from `CanonicalAlert.alert_id`, never LLM-sourced (the LLM never sees or
-    reports it; `TriageVerdict` has no such field, and none was added — this
-    is already-known data flowing through `evidence.canonical_alert`, not
-    something to ask the model to echo back). On a merge case this is the
-    only place the ORIGINAL/first alert's id survives in the case's own
-    title; `_build_case_description`'s alert-identity line is what makes
-    every SUBSEQUENT merged alert's id/rule visible too, since each merge
-    only ever gets a comment, not a new title."""
+    2026-09-07, user-directed: the alert_id is NOT in the title. It appears
+    only in `_build_case_description`'s alert-identity heading (which is
+    written both as the new case's description AND as every merge comment,
+    so each merged alert's id/rule stays visible there) and in
+    `TriageResult.alert_id` in the HTTP response. An earlier revision the
+    same day appended `(alert {alert_id})` here; that was reverted on the
+    user's instruction — the title carries priority/rule/host only."""
     alert = evidence.canonical_alert
     host = alert.host.hostname if alert.host else "unknown-host"
-    return f"[{verdict.priority_band}] {alert.rule.name} — {host} (alert {alert.alert_id})"
+    return f"[{verdict.priority_band}] {alert.rule.name} — {host}"
 
 
 def _build_case_tags(verdict: TriageVerdict, evidence: EnrichedEvidence) -> list[str]:
@@ -364,6 +397,14 @@ async def _case_action(
 ) -> CaseActionResult:
     alert = evidence.canonical_alert
     thehive_alert_id = alert.thehive_alert_id
+
+    # 2026-09-07, user-directed: a false_positive verdict never opens a case.
+    # The triage narrative goes on the ALERT as a comment and the alert is
+    # dropped to low/clear in place. FP feedback is wired separately, before
+    # this node runs (main.py::_record_fp_feedback). See CLAUDE.md.
+    if verdict.verdict == "false_positive":
+        return await _false_positive_alert_action(verdict, evidence)
+
     logger.info(
         "Case action started: correlation_action=%s merge_target=%s",
         verdict.correlation_decision.action,
@@ -371,8 +412,9 @@ async def _case_action(
     )
     # v5 (`newdesign.md` §7-§8): severity now keys off TriageVerdict.
     # priority_band directly — the deleted PriorityScore/deployment_mode
-    # shadow-vs-live distinction no longer exists.
+    # shadow-vs-live distinction no longer exists. tlp too (2026-09-07).
     severity = PRIORITY_TO_HIVE_SEVERITY.get(verdict.priority_band, 2)
+    tlp = PRIORITY_TO_HIVE_TLP.get(verdict.priority_band, _DEFAULT_TLP)
     title = _build_case_title(verdict, evidence)
     description = _build_case_description(verdict, evidence)
     tags = _build_case_tags(verdict, evidence)
@@ -395,10 +437,14 @@ async def _case_action(
             description=description,
             severity=severity,
             tags=tags,
+            tlp=tlp,
         )
         if shallow is None:
             logger.warning("Case action failed: could not create case: %s", gap.reason if gap else "unknown")
-            return CaseActionResult(success=False, is_new_case=True, error=gap.reason if gap else "unknown error")
+            return CaseActionResult(
+                success=False, action_taken="new_case", is_new_case=True,
+                error=gap.reason if gap else "unknown error",
+            )
 
         # Write Stage 4's actionable_observables to the new case.
         enriched_obs, obs_written, obs_failed = await _write_actionable_observables(
@@ -412,16 +458,24 @@ async def _case_action(
 
         new_result = CaseActionResult(
             success=True,
+            action_taken="new_case",
             case_id=shallow.case_id,
             case_number=shallow.case_number,
             is_new_case=True,
             severity=shallow.severity,
+            # tlp as requested from priority_band — ShallowCase doesn't carry
+            # it back, but create_case_from_alert's PATCH set it.
+            tlp=tlp,
             stage=shallow.stage,
             status=shallow.status,
             tags=shallow.tags,
             observables_written=obs_written,
             observables_failed=obs_failed,
             actionable_observables_written=enriched_obs,
+            # The exact Markdown written as this new case's description —
+            # surfaced back in TriageResult so the /triage caller sees what
+            # landed in TheHive without a second round trip.
+            case_narrative=description,
             error=error_msg,  # partial-success case: created but content push or observable writes failed
         )
         logger.info(
@@ -435,10 +489,15 @@ async def _case_action(
 
     # action == "merge", merge_into_case_id is a real id
     merged, gap = await thehive.merge_alert_into_case(thehive_alert_id, merge_into_case_id)
+    merge_target_number = next(
+        (c.case_number for c in evidence.open_cases if c.case_id == merge_into_case_id),
+        None,
+    )
     if not merged:
         logger.warning("Case action failed: could not merge into %s: %s", merge_into_case_id, gap.reason if gap else "unknown")
         return CaseActionResult(
-            success=False, case_id=merge_into_case_id, is_new_case=False,
+            success=False, action_taken="merge", case_id=merge_into_case_id,
+            case_number=merge_target_number, is_new_case=False,
             error=gap.reason if gap else "unknown error",
         )
 
@@ -449,13 +508,22 @@ async def _case_action(
 
     result = CaseActionResult(
         success=True,
+        action_taken="merge",
         case_id=merge_into_case_id,
+        # TheHive's merge endpoint doesn't return the case body, but the
+        # merge target is always one of `evidence.open_cases` (enforced by
+        # the Stage-3 `_validate_merge_target` check), so its number is
+        # already in hand — no extra round trip.
+        case_number=merge_target_number,
         is_new_case=False,
         severity=severity,
         tags=tags,
         observables_written=obs_written,
         observables_failed=obs_failed,
         actionable_observables_written=enriched_obs,
+        # Same Markdown that gets posted as the merge comment below — see
+        # the new-case path's note.
+        case_narrative=description,
     )
     if obs_failed:
         gap_summary = f"{obs_failed} observable write(s) failed"
@@ -463,11 +531,13 @@ async def _case_action(
 
     if verdict.recommended_action == "merge_and_retier":
         updated, update_gap = await thehive.update_case(
-            merge_into_case_id, severity=severity, add_tags=tags
+            merge_into_case_id, severity=severity, tlp=tlp, add_tags=tags
         )
-        if not updated:
+        if updated:
+            result.tlp = tlp
+        else:
             logger.warning(
-                "case_action: merge_and_retier severity update failed for case %s: %s",
+                "case_action: merge_and_retier severity/tlp update failed for case %s: %s",
                 merge_into_case_id,
                 update_gap.reason if update_gap else "unknown",
             )
@@ -489,5 +559,62 @@ async def _case_action(
         result.comment_added,
         obs_written,
         obs_written + obs_failed,
+    )
+    return result
+
+
+async def _false_positive_alert_action(
+    verdict: TriageVerdict, evidence: EnrichedEvidence
+) -> CaseActionResult:
+    """`verdict.verdict == "false_positive"` — no case, ever. Two writes to
+    the alert itself: the triage narrative as a comment, and severity/TLP
+    forced to the floor (low / clear). Neither raises. `success` tracks the
+    comment (the narrative landing on the alert is the point); a failed
+    severity/TLP patch is appended to `error` but doesn't flip `success`,
+    same posture as the merge path's comment handling."""
+    alert = evidence.canonical_alert
+    thehive_alert_id = alert.thehive_alert_id
+    logger.info("Case action started: verdict=false_positive — annotating alert, no case")
+
+    description = _build_case_description(verdict, evidence)
+
+    result = CaseActionResult(
+        success=False,
+        action_taken="fp_alert",
+        is_new_case=False,
+        severity=FP_ALERT_SEVERITY,
+        tlp=FP_ALERT_TLP,
+        case_narrative=description,
+    )
+
+    if not thehive_alert_id:
+        result.error = "No thehive_alert_id — cannot annotate the alert for a false positive"
+        logger.warning("Case action failed: %s", result.error)
+        return result
+
+    commented, comment_gap = await thehive.add_alert_comment(thehive_alert_id, description)
+    result.comment_added = commented
+    result.success = commented
+    if not commented:
+        result.error = (
+            f"FP alert comment failed: {comment_gap.reason if comment_gap else 'unknown'}"
+        )
+
+    updated, update_gap = await thehive.update_alert(
+        thehive_alert_id, severity=FP_ALERT_SEVERITY, tlp=FP_ALERT_TLP
+    )
+    if not updated:
+        reason = update_gap.reason if update_gap else "unknown"
+        result.error = (
+            f"{result.error}; FP alert severity/tlp update failed: {reason}"
+            if result.error
+            else f"FP alert severity/tlp update failed: {reason}"
+        )
+
+    logger.info(
+        "Case action completed: false_positive — alert comment_added=%s severity=%s tlp=%s",
+        result.comment_added,
+        FP_ALERT_SEVERITY,
+        FP_ALERT_TLP,
     )
     return result

@@ -1,6 +1,22 @@
 """Top-level triage result contract — v6 single-call redesign (2026-09-06),
 building on v5 (`newdesign.md`).
 
+**v7 response trim (2026-09-07, user-directed).** The `/triage` response is
+the LLM's analysis + the case outcome, not the evidence behind it:
+- `gathered_evidence` (the full `EnrichedEvidence` dump) REMOVED.
+- `threat_intel` (flat `CortexResult` list) REMOVED — analyzer rows now hang
+  off the observable they belong to, via the new `IocObservable` model, and
+  only `ioc: true` observables are surfaced.
+- `IocObservable` ADDED: `{observable_id, data_type, value, tags,
+  analyzer_results}`, assembled in `main.py::_build_ioc_observables` from
+  `hive_alert.observables` + `canonical_alert.cortex_results`. No OpenCTI
+  graph data (user asked for analyzer result only).
+- `CaseActionResult.case_narrative` (new field on that model) carries the
+  Markdown written into TheHive.
+- The case TITLE no longer contains the alert id (`nodes/case_action.py::
+  _build_case_title`) — the alert is identified by `alert_id` here and by
+  the description heading in TheHive.
+
 **v5 deletes the numeric/matrix scoring stage entirely** — `scoring.py`,
 `scoring_config.py`, `nodes/score.py`, and this module's former `PriorityScore`
 class (SOC-3s Scoring System v3, `newscoresystem.md`) are all gone. Priority
@@ -45,16 +61,61 @@ from pydantic import BaseModel, Field
 from schemas.alert import CortexResult
 from schemas.assessment import EvidenceSituation, MitreMapping
 from schemas.case_action import CaseActionResult
-from schemas.evidence import EnrichedEvidence
 from schemas.verdict import ActionableObservable, TriageVerdict
+
+
+class IocObservable(BaseModel):
+    """One of the alert's IOC observables (from `hive_alert.observables`,
+    flagged `ioc: true`) plus the Cortex analyzer output that ran against it
+    before `/triage` was called.
+
+    2026-09-07, user-directed: the `/triage` response used to carry a flat
+    top-level `threat_intel: list[CortexResult]`. That's gone — the analyzer
+    rows now hang off the observable they belong to, and only `ioc: true`
+    observables are surfaced (hostname / endpoint-ip / other non-IOC rows on
+    the alert are dropped from the response). The live-GraphQL OpenCTI
+    enrichment (`OpenCTIEnrichment`) is deliberately NOT included here — the
+    user asked for the analyzer result only, not the OpenCTI threat graph.
+
+    `analyzer_results` joins `CortexResult` by observable value
+    (`CortexResult.observable == this.value`) — assembled in
+    `main.py::_build_ioc_observables`, not a stage boundary of its own."""
+
+    observable_id: str
+    data_type: str
+    value: str
+    tags: list[str] = Field(default_factory=list)
+    analyzer_results: list[CortexResult] = Field(default_factory=list)
 
 
 class TriageResult(BaseModel):
     """The top-level result of one alert's triage — what `main.py`'s
     `/triage` endpoint actually returns to n8n (architecture §3), wrapped in
-    `TriageResponse` below."""
+    `TriageResponse` below.
+
+    2026-09-07, user-directed trim: the response is the LLM's analysis plus
+    the case outcome — NOT the evidence it reasoned over. `gathered_evidence`
+    (the full `EnrichedEvidence` Stage 1+2 dump) and the flat `threat_intel`
+    list are both removed. What stays: the flattened verdict fields, the
+    alert's `ioc: true` observables with their analyzer results
+    (`ioc_observables`), the LLM-extracted `actionable_observables` with the
+    TheHive id each was written as, `evidence_situation` (the LLM's own
+    per-source reliability read — an analysis output, not raw evidence),
+    `triage_assessment` (the complete `TriageVerdict` object), and
+    `case_action` (including `case_narrative`, the Markdown written into
+    TheHive)."""
 
     alert_id: str
+    # The TheHive case this alert ended up in — the newly-created case's id
+    # when `is_new_case`, otherwise the id of the case it was merged into.
+    # Both are surfaced at the top level (2026-09-07, user-directed) next to
+    # `alert_id`; the full detail (number, severity, status, tags, the
+    # written narrative, ...) stays on `case_action` below. Empty only when
+    # case creation itself failed — a merge always carries its target id even
+    # on failure, since that id is known before the call.
+    case_id: str = ""
+    case_number: int | None = None
+    is_new_case: bool = False
     verdict: str
     recommended_action: str
     summary: str
@@ -62,19 +123,16 @@ class TriageResult(BaseModel):
     likelihood: str = ""
     impact_if_true: str = ""
     evidence_citations: list[str] = Field(default_factory=list)
+    ioc_observables: list[IocObservable] = Field(default_factory=list)
     actionable_observables: list[ActionableObservable] = Field(default_factory=list)
     correlation_reasoning: str = ""
     refined_mitre_mapping: list[MitreMapping] = Field(default_factory=list)
     investigation_gaps: list[str] = Field(default_factory=list)
-    threat_intel: list[CortexResult] = Field(default_factory=list)
-    # gathered_evidence/triage_assessment are the COMPLETE Stage 1+2 output
-    # and the complete single-call output, not cherry-picked fields —
-    # deliberately redundant with several flat fields above (e.g.
+    # triage_assessment is the COMPLETE single-call output, not cherry-picked
+    # fields — deliberately redundant with the flat fields above (e.g.
     # correlation_reasoning/refined_mitre_mapping are already reachable
-    # through triage_assessment) — the flat fields stay for quick-glance
-    # access without walking the nested structure, these two are the full
-    # audit trail underneath them.
-    gathered_evidence: EnrichedEvidence | None = None
+    # through it). The flat fields stay for quick-glance access; this is the
+    # full LLM-analysis object underneath them. It carries no raw evidence.
     triage_assessment: TriageVerdict | None = None
     priority_band: str = ""
     priority_reasoning: str = ""
