@@ -1,0 +1,14 @@
+.env
+.env.*
+!.env.example
+
+__pycache__/
+*.pyc
+
+logs/
+*.log
+
+data/*.db
+
+# Runtime/generated data
+*.db-journal
