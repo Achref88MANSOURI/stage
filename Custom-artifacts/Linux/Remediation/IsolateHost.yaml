@@ -1,0 +1,104 @@
+name: Custom.Linux.Remediation.IsolateHost
+description: |
+  Network-isolates a Linux endpoint using dedicated iptables chains
+  (VR_ISOLATE_IN / VR_ISOLATE_OUT), jumped from INPUT/OUTPUT position 1.
+  This preserves and can fully restore any pre-existing firewall rules --
+  it does NOT flush or replace the existing policy.
+
+  ISOLATE (RemovePolicy=FALSE): creates the two chains, allows only the
+  Velociraptor server address (and optional AllowInterface) inbound and
+  outbound, drops everything else, then inserts jump rules at position 1
+  of INPUT and OUTPUT so isolation takes effect before any existing rule
+  is evaluated.
+
+  UN-ISOLATE (RemovePolicy=TRUE): removes the jump rules and deletes the
+  two chains, restoring the exact pre-isolation ruleset.
+
+  ReallyDoIt=FALSE (default) is a dry run: reports the exact iptables
+  commands it would execute without running them.
+
+author: TrustShield / SOC-3s
+type: CLIENT
+
+parameters:
+  - name: VelociraptorServerCIDR
+    default: ""
+    description: >
+      Velociraptor server address in CIDR form (e.g. 100.84.64.90/32).
+      Must match the address this client actually uses per its own
+      client.config.yaml server_urls -- never assumed from documentation.
+      This address stays reachable inbound and outbound while isolated.
+
+  - name: AllowInterface
+    default: ""
+    description: >
+      Optional. A network interface name (e.g. tailscale0) to leave fully
+      open in both directions in addition to the server CIDR allow rule.
+      Leave blank to rely on the server CIDR rule alone.
+
+  - name: RemovePolicy
+    type: bool
+    default: N
+    description: >
+      TRUE = un-isolate: remove the jump rules and delete the
+      VR_ISOLATE_IN/VR_ISOLATE_OUT chains, restoring prior rules exactly.
+      FALSE (default) = isolate.
+
+  - name: ReallyDoIt
+    type: bool
+    default: N
+    description: >
+      TRUE = actually run the commands. FALSE (default) = dry run, reports
+      the exact commands without executing them.
+
+precondition: SELECT OS FROM info() WHERE OS = 'linux'
+
+sources:
+  - query: |
+      LET Isolate_a = ("iptables", "-N", "VR_ISOLATE_IN")
+      LET Isolate_b = ("iptables", "-N", "VR_ISOLATE_OUT")
+      LET Isolate_c = ("iptables", "-A", "VR_ISOLATE_IN", "-i", AllowInterface, "-j", "RETURN")
+      LET Isolate_d = ("iptables", "-A", "VR_ISOLATE_OUT", "-o", AllowInterface, "-j", "RETURN")
+      LET Isolate_e = ("iptables", "-A", "VR_ISOLATE_IN", "-s", VelociraptorServerCIDR, "-j", "RETURN")
+      LET Isolate_f = ("iptables", "-A", "VR_ISOLATE_OUT", "-d", VelociraptorServerCIDR, "-j", "RETURN")
+      LET Isolate_g = ("iptables", "-A", "VR_ISOLATE_IN", "-j", "DROP")
+      LET Isolate_h = ("iptables", "-A", "VR_ISOLATE_OUT", "-j", "DROP")
+      LET Isolate_i = ("iptables", "-I", "INPUT", "1", "-j", "VR_ISOLATE_IN")
+      LET Isolate_j = ("iptables", "-I", "OUTPUT", "1", "-j", "VR_ISOLATE_OUT")
+
+      LET Remove_a = ("iptables", "-D", "INPUT", "-j", "VR_ISOLATE_IN")
+      LET Remove_b = ("iptables", "-D", "OUTPUT", "-j", "VR_ISOLATE_OUT")
+      LET Remove_c = ("iptables", "-F", "VR_ISOLATE_IN")
+      LET Remove_d = ("iptables", "-F", "VR_ISOLATE_OUT")
+      LET Remove_e = ("iptables", "-X", "VR_ISOLATE_IN")
+      LET Remove_f = ("iptables", "-X", "VR_ISOLATE_OUT")
+
+      LET IsolateCmds = SELECT * FROM chain(
+        a={ SELECT Isolate_a AS Argv FROM scope() },
+        b={ SELECT Isolate_b AS Argv FROM scope() },
+        c={ SELECT Isolate_c AS Argv FROM scope() WHERE AllowInterface != "" },
+        d={ SELECT Isolate_d AS Argv FROM scope() WHERE AllowInterface != "" },
+        e={ SELECT Isolate_e AS Argv FROM scope() WHERE VelociraptorServerCIDR != "" },
+        f={ SELECT Isolate_f AS Argv FROM scope() WHERE VelociraptorServerCIDR != "" },
+        g={ SELECT Isolate_g AS Argv FROM scope() },
+        h={ SELECT Isolate_h AS Argv FROM scope() },
+        i={ SELECT Isolate_i AS Argv FROM scope() },
+        j={ SELECT Isolate_j AS Argv FROM scope() }
+      )
+
+      LET RemoveCmds = SELECT * FROM chain(
+        a={ SELECT Remove_a AS Argv FROM scope() },
+        b={ SELECT Remove_b AS Argv FROM scope() },
+        c={ SELECT Remove_c AS Argv FROM scope() },
+        d={ SELECT Remove_d AS Argv FROM scope() },
+        e={ SELECT Remove_e AS Argv FROM scope() },
+        f={ SELECT Remove_f AS Argv FROM scope() }
+      )
+
+      LET Commands <= SELECT * FROM if(condition=RemovePolicy, then=RemoveCmds, else=IsolateCmds)
+
+      SELECT * FROM foreach(row=Commands, query={
+        SELECT * FROM if(condition=ReallyDoIt,
+           then={ SELECT Argv, Stdout, Stderr, ReturnCode FROM execve(argv=Argv) },
+           else={ SELECT Argv, "DRY RUN - not executed" AS Stdout, "" AS Stderr, 0 AS ReturnCode FROM scope() })
+      })

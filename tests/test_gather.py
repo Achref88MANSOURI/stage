@@ -1,21 +1,10 @@
-"""`gather_evidence` — Stage 1, architecture §6.
+"""Tests for `gather_evidence`.
 
-This node has no backend of its own — it orchestrates six already
-individually real-backend-verified tools (each has its own
-`tests/test_*.py` with real captured fixtures). These tests mock every tool
-function at its source module (`tools.*`) and check the orchestration logic
-only: correct call routing, timeout/exception containment, and
-`RawEvidence` assembly. (The `event_dataset` gate this docstring used to
-mention drove `elasticsearch_process_history`'s dataset check — that tool
-was removed 2026-09-06, user-directed; no dataset-gating logic remains in
-this node.)
-
-`test_live_against_real_backends` is the exception — it runs
-`gather_evidence` against the real alert built from
-`tests/fixtures/sigma-alert-real.json` via `alert_builder.py`, hitting every
-real backend (ES, TheHive, iTop, OpenCTI, the local FP SQLite file) with no
-mocking, matching implementation guide §2's "call it against the real
-backend at least once" for this node.
+This stage has no backend logic of its own — it orchestrates several tools
+that each have their own dedicated test file with real captured fixtures.
+These tests mock every tool at its source module and check only the
+orchestration logic: call routing, timeout/exception containment, and
+`RawEvidence` assembly.
 """
 
 from __future__ import annotations
@@ -25,7 +14,7 @@ from datetime import datetime, timezone
 
 import pytest
 
-from nodes import gather as gather_mod
+from stages import gather as gather_mod
 from schemas import (
     AssetContext,
     CanonicalAlert,
@@ -33,9 +22,8 @@ from schemas import (
     Host,
     Rule,
     RuleContext,
-    User,
 )
-from tools import detection_rules, elasticsearch, fp_tracking, itop, opencti, thehive
+from tools import detection_rules, fp_tracking, itop, opencti, thehive
 
 
 def run(coro):
@@ -48,7 +36,6 @@ def make_alert(**overrides) -> CanonicalAlert:
         timestamp=datetime.now(timezone.utc),
         rule=Rule(name="Suspicious Invoke-WebRequest Execution", uuid="5e3cc4d8-3e68-43db-8656-eaaeefdec9cc"),
         host=Host(hostname="win-kvkmd51ggkq", host_id="c8fc26bf-dc76-4dba-adbb-bf31640d9c9f"),
-        user=User(name="Administrator"),
         event_dataset="endpoint.events.process",
     )
     defaults.update(overrides)
@@ -72,7 +59,6 @@ def patch_all_ok(monkeypatch, *, calls=None):
         "detection_rule_lookup": (RuleContext(found=True, rule_uuid="x"), None),
         "search_open_cases_by_entities": ([], None),
         "itop_asset_lookup": (AssetContext(found=True, hostname="win-kvkmd51ggkq"), None),
-        "elasticsearch_related_alerts": ([], None),
         "opencti_observable_enrichment": ([], None),
     }
 
@@ -82,9 +68,6 @@ def patch_all_ok(monkeypatch, *, calls=None):
         thehive, "search_open_cases_by_entities", record("search_open_cases_by_entities")
     )
     monkeypatch.setattr(itop, "itop_asset_lookup", record("itop_asset_lookup"))
-    monkeypatch.setattr(
-        elasticsearch, "elasticsearch_related_alerts", record("elasticsearch_related_alerts")
-    )
     monkeypatch.setattr(
         opencti, "opencti_observable_enrichment", record("opencti_observable_enrichment")
     )
@@ -146,9 +129,9 @@ class TestGatherLevelTimeout:
 
 class TestUnexpectedExceptionIsContained:
     def test_tool_raising_does_not_crash_gather_evidence(self, monkeypatch):
-        """Simulates a bug in a tool despite its own 'never raises' contract.
-        Proves the hard constraint: gather_evidence must never propagate an
-        unhandled exception to its caller."""
+        """Simulates a tool breaking its own "never raises" contract.
+        gather_evidence must still never propagate an unhandled exception
+        to its caller."""
         patch_all_ok(monkeypatch)
 
         async def broken_detection_rule_lookup(*args, **kwargs):
@@ -181,44 +164,15 @@ class TestMissingHostOrUser:
         assert itop_args[0] is None  # hostname
         assert itop_args[1] is None  # host_id
 
-        thehive_args = calls["search_open_cases_by_entities"][0][0]
-        assert thehive_args[1] is None  # host str
-        assert thehive_args[2] is None  # user str
-
-        es_args = calls["elasticsearch_related_alerts"][0][0]
-        assert es_args[0] is None  # Host object
-        assert es_args[1] is None  # User object
-
 
 class TestTheHiveAlertIdThreadedThrough:
-    """Gap #12 — thehive_alert_id must reach thehive.py's open-case call so
-    its similarCases fast path can fire. (Previously also asserted this for
-    search_closed_cases_by_rule — removed 2026-09-06, user-directed; see
-    tools/thehive.py's module docstring.)"""
+    """thehive_alert_id must reach thehive.py's open-case search, since
+    that call needs it to look up similar cases."""
 
     def test_thehive_alert_id_passed_to_open_case_search(self, monkeypatch):
         calls: dict = {}
         patch_all_ok(monkeypatch, calls=calls)
         run(gather_mod.gather_evidence(make_alert(thehive_alert_id="~4661456")))
 
-        open_kwargs = calls["search_open_cases_by_entities"][0][1]
-        assert open_kwargs.get("thehive_alert_id") == "~4661456"
-
-
-class TestRelatedAlertsWindow:
-    """2026-09-06, user-directed — related alerts narrowed from the tool's
-    own 24h default to 1h, to keep this signal tight to genuinely concurrent
-    activity and shrink Stage 3's prompt."""
-
-    def test_related_alerts_queried_with_one_hour_window(self, monkeypatch):
-        calls: dict = {}
-        patch_all_ok(monkeypatch, calls=calls)
-        run(gather_mod.gather_evidence(make_alert()))
-
-        related_kwargs = calls["elasticsearch_related_alerts"][0][1]
-        assert related_kwargs.get("hours") == 1
-
-    def test_result_lands_on_related_alerts_1h_field(self, monkeypatch):
-        patch_all_ok(monkeypatch)
-        evidence = run(gather_mod.gather_evidence(make_alert()))
-        assert evidence.related_alerts_1h == []
+        open_args = calls["search_open_cases_by_entities"][0][0]
+        assert open_args[0] == "~4661456"

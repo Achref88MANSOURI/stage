@@ -1,0 +1,83 @@
+{
+  "name": "VR_IsolateHost",
+  "version": "1.0",
+  "author": "TrustShield / SOC-3s",
+  "url": "",
+  "license": "AGPL-V3",
+  "description": "Network-isolate a managed endpoint via Velociraptor. Linux: dedicated iptables chains (VR_ISOLATE_IN/VR_ISOLATE_OUT) jumped from INPUT/OUTPUT position 1, preserving pre-existing rules. Windows: netsh advfirewall, allow-rule for the Velociraptor server created first, then blockinbound/blockoutbound applied. Triggered directly on 'endpoint-ip' or 'hostname' -- the trigger IS the target, no case-observable lookup required. Supports RemovePolicy for un-isolation using the same artifact.",
+  "dataTypeList": ["thehive:case_artifact"],
+  "command": "Velociraptor/vr_isolatehost.py",
+  "baseConfig": "VR_IsolateHost",
+  "config": {
+    "service": "VR_IsolateHost"
+  },
+  "configurationItems": [
+    {
+      "name": "velociraptor_api_config",
+      "description": "Path to the Velociraptor API client config YAML on the Cortex host (e.g. /opt/cortex/velociraptor/api_client.yaml).",
+      "type": "string",
+      "multi": false,
+      "required": true
+    },
+    {
+      "name": "thehive_url",
+      "description": "TheHive base URL (e.g. http://172.20.24.228:9000).",
+      "type": "string",
+      "multi": false,
+      "required": true
+    },
+    {
+      "name": "thehive_apikey",
+      "description": "TheHive API key for the Cortex service account. Used to write a case note confirming isolation/un-isolation status.",
+      "type": "string",
+      "multi": false,
+      "required": true
+    },
+    {
+      "name": "velociraptor_server_address",
+      "description": "The Velociraptor server address the endpoint ACTUALLY uses to connect (check server_urls in the client's own client.config.yaml -- may be a Tailscale IP, not the LAN IP). Enter as a bare IP address (e.g. 100.84.64.90) -- the handler appends /32 for the Linux CIDR parameter and passes it as-is for the Windows IP parameter. Whitelisted so the endpoint keeps management connectivity while isolated. Getting this wrong is a one-way lockout.",
+      "type": "string",
+      "multi": false,
+      "required": true
+    },
+    {
+      "name": "allow_interface",
+      "description": "Linux only. Optional network interface to leave fully open (e.g. a management/Tailscale interface name) in addition to the server-address whitelist. Leave blank if not needed.",
+      "type": "string",
+      "multi": false,
+      "required": false
+    },
+    {
+      "name": "remove_policy",
+      "description": "Set to true to UN-isolate instead of isolating. Linux: removes the VR_ISOLATE_IN/VR_ISOLATE_OUT chains, restoring whatever rules existed before isolation. Windows: restores Windows Firewall factory default (blockinbound,allowoutbound) -- this is NOT necessarily the host's original policy, which may have been GPO-managed or otherwise hardened. false = isolate.",
+      "type": "boolean",
+      "multi": false,
+      "required": false,
+      "defaultValue": false
+    },
+    {
+      "name": "really_do_it",
+      "description": "Set to true to actually apply the change. false = dry-run: the artifact reports the exact commands it would run without executing them.",
+      "type": "boolean",
+      "multi": false,
+      "required": false,
+      "defaultValue": false
+    },
+    {
+      "name": "poll_timeout_seconds",
+      "description": "Maximum seconds to wait for the Velociraptor flow to complete. Default: 120.",
+      "type": "number",
+      "multi": false,
+      "required": false,
+      "defaultValue": 120
+    },
+    {
+      "name": "poll_interval_seconds",
+      "description": "Polling interval in seconds. Default: 5.",
+      "type": "number",
+      "multi": false,
+      "required": false,
+      "defaultValue": 5
+    }
+  ]
+}

@@ -1,13 +1,13 @@
-"""`tools/thehive.py::add_alert_comment` + `update_alert` — the two
-alert-level write primitives added 2026-09-07 for the `false_positive`
-branch of `nodes/case_action.py` (annotate the alert, never a case).
+"""Tests for `tools/thehive.py::add_alert_comment` and `update_alert` — the
+two alert-level write calls the false_positive branch of
+`stages/case_action.py` uses to annotate an alert directly, without opening
+a case.
 
-PROVENANCE: `tests/fixtures/thehive_alert_writes_real.json` is REAL —
-captured live 2026-09-07 against `http://172.20.24.228:9000` (TheHive
-5.7.5), alert `~46149872`. It holds the real
+`tests/fixtures/thehive_alert_writes_real.json` was captured live against a
+TheHive 5.7.5 instance (alert `~46149872`): the real
 `POST /api/v1/alert/{id}/comment` response (201, a Comment object) and the
-real `PATCH /api/v1/alert/{id}` response (204, empty body). The mocked tests
-below are built from those shapes, not imagined ones.
+real `PATCH /api/v1/alert/{id}` response (204, empty body). The mocked
+tests below are built from those captured response shapes.
 """
 
 import json
@@ -84,6 +84,25 @@ class TestUpdateAlert:
             mock_write.return_value = MagicMock()
             run(update_alert("~a1", tlp=4))
         assert mock_write.call_args[0][3] == {"tlp": 4}
+
+    def test_status_and_summary_close_the_alert_as_false_positive(self):
+        """A false_positive verdict closes the alert by setting
+        status="FalsePositive", a real value in this instance's alert
+        status enum."""
+        with patch("tools.thehive._write", new_callable=AsyncMock) as mock_write:
+            mock_write.return_value = MagicMock()
+            ok, gap = run(
+                update_alert(
+                    "~a1", severity=1, tlp=0, status="FalsePositive", summary="benign scan"
+                )
+            )
+        assert ok is True and gap is None
+        assert mock_write.call_args[0][3] == {
+            "severity": 1,
+            "tlp": 0,
+            "status": "FalsePositive",
+            "summary": "benign scan",
+        }
 
     def test_no_fields_is_a_gap(self):
         with patch("tools.thehive._write", new_callable=AsyncMock) as mock_write:

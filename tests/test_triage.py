@@ -1,17 +1,7 @@
-"""`nodes/triage.py::single_stage_triage` — v6 single-call redesign
-(SOC-3s v6 spec, 2026-09-06). Replaces the deleted `tests/test_context.py`
-(Stage 3) and `tests/test_analyze.py` (Stage 4).
-
-**Provenance note, stated plainly**: the two deleted test files were removed
-before their full content was captured for migration, and this repo's git
-history has exactly one commit predating both files — there is no way to
-recover their exact original test list. This file REBUILDS the load-bearing
-regression coverage directly from `nodes/triage.py`'s and
-`prompts/triage_agent.py`'s actual current implementation (schema/model sync,
-the merge-target and recommended_action consistency validators, the
-JSON-escaping-safe hallucination guard, `_capped_max_tokens`, the fallback),
-not a byte-for-byte port of what existed before. Treat this as a genuine
-rebuild, not a recovery.
+"""`stages/triage.py::single_stage_triage` tests: schema/model sync, the
+merge-target and recommended_action consistency validators, the
+JSON-escaping-safe hallucination guard, `_capped_max_tokens`, and the
+deterministic fallback.
 
 Fallback-specific coverage (P2 default, empty observables, needs_review
 verdict, safety_gate_applied=True) lives in `tests/test_fallback.py`.
@@ -30,7 +20,7 @@ import httpx
 import pytest
 
 import config
-from nodes import triage as triage_mod
+from stages import triage as triage_mod
 from schemas import (
     ActionableObservable,
     CanonicalAlert,
@@ -38,12 +28,10 @@ from schemas import (
     EnrichedEvidence,
     EvidenceSituation,
     Host,
-    Process,
     RawEvidence,
     Rule,
     ShallowCase,
     TriageVerdict,
-    User,
 )
 
 
@@ -57,7 +45,6 @@ def make_alert(**overrides) -> CanonicalAlert:
         timestamp=datetime.now(timezone.utc),
         rule=Rule(name="Suspicious Invoke-WebRequest Execution", uuid="5e3cc4d8-…"),
         host=Host(hostname="win-kvkmd51ggkq"),
-        user=User(name="Administrator"),
     )
     defaults.update(overrides)
     return CanonicalAlert(**defaults)
@@ -118,9 +105,8 @@ def fake_response(content: str, status_code: int = 200) -> httpx.Response:
 
 
 class TestSchemaStaysInSync:
-    """Regression guard for the two schemas silently drifting apart on a
-    future field change to TriageVerdict — mirrors the identical guard the
-    two deleted (Stage 3/Stage 4) prompt modules each had independently."""
+    """Regression guard for the hand-inlined JSON schema and `TriageVerdict`
+    silently drifting apart on a future field change."""
 
     def test_every_required_triage_verdict_field_is_in_the_schema(self):
         import prompts.triage_agent as prompts
@@ -129,14 +115,14 @@ class TestSchemaStaysInSync:
         schema_props = set(schema["properties"].keys())
         model_fields = set(TriageVerdict.model_fields.keys())
         # stage_duration_ms and safety_gate_applied are set post-hoc, never
-        # sent to the LLM — see nodes/triage.py's module docstring.
+        # sent to the LLM — see stages/triage.py's module docstring.
         expected_absent = {"stage_duration_ms", "safety_gate_applied"}
         assert model_fields - expected_absent <= schema_props
 
     def test_schema_has_zero_defs_or_refs(self):
-        """The non-negotiable constraint — see prompts/triage_agent.py's
-        module docstring for the live-verified 280+-second hang this
-        prevents."""
+        """See prompts/triage_agent.py's module docstring for why a
+        `$defs`/`$ref`-based schema can hang the grammar-constrained
+        decoder."""
         import prompts.triage_agent as prompts
 
         schema_text = json.dumps(prompts.build_triage_verdict_schema(make_evidence()))
@@ -172,9 +158,9 @@ class TestDynamicMergeSchema:
 
         assert correlation["merge_into_case_id"]["enum"] == ["~1", "~2", None]
         assert correlation["action"]["enum"] == ["new", "merge"]
-        # v6: recommended_action can't be narrowed to one branch ahead of
-        # generation any more (both fields come from the same response) —
-        # see prompts/triage_agent.py's module docstring. All 5 stay legal.
+        # recommended_action can't be narrowed to one branch ahead of
+        # generation (both fields come from the same response) — see
+        # prompts/triage_agent.py's module docstring. All 5 stay legal.
         assert schema["properties"]["recommended_action"]["enum"] == [
             "create_case",
             "close_fp",
@@ -216,7 +202,8 @@ class TestMergeTargetValidation:
 
 
 # ===========================================================================
-# _validate_recommended_action — the new v6-specific consistency check
+# _validate_recommended_action — consistency check between
+# correlation_decision.action and recommended_action
 # ===========================================================================
 
 
@@ -253,7 +240,7 @@ class TestRecommendedActionValidation:
 
 class TestActionableObservablesValidation:
     def test_value_present_in_evidence_is_kept(self):
-        evidence = make_evidence(process=Process(command_line="cmd.exe /c whoami"))
+        evidence = make_evidence(raw_alert={"note": "cmd.exe /c whoami"})
         verdict = make_verdict(
             actionable_observables=[make_actionable_observable("cmd.exe /c whoami")]
         )
@@ -270,12 +257,12 @@ class TestActionableObservablesValidation:
         assert any("totally-fabricated-value.example" in g for g in result.investigation_gaps)
 
     def test_backslash_bearing_windows_path_is_not_falsely_discarded(self):
-        """The 2026-08-23 live-caught bug this guards against: a genuine
-        Windows path was discarded because evidence.model_dump_json()
-        JSON-escapes backslashes but the raw LLM value doesn't carry that
-        escaping — comparing them directly always missed a real match."""
+        """Regression guard: a genuine Windows path must not be discarded
+        because evidence.model_dump_json() JSON-escapes backslashes while
+        the raw LLM value doesn't carry that escaping — comparing them
+        directly would always miss a real match."""
         evidence = make_evidence(
-            process=Process(command_line=r"powershell -OutFile C:\Windows\Temp\xordump.exe")
+            raw_alert={"note": r"powershell -OutFile C:\Windows\Temp\xordump.exe"}
         )
         verdict = make_verdict(
             actionable_observables=[

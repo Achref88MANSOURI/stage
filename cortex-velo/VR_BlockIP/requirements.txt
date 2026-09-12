@@ -1,0 +1,5 @@
+cortexutils
+thehive4py>=2.1.0
+grpcio
+pyvelociraptor
+cryptography

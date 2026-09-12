@@ -1,12 +1,6 @@
-"""`TriageResult` — v5 redesign (`newdesign.md` §6). No more `PriorityScore`;
-priority fields now come straight from `TriageVerdict` via
-`main.py::_build_triage_result`, a thin, math-free assembly function that
-replaces the deleted `nodes/score.py::priority_scoring` Stage 5 node.
-
-**v6 redesign (2026-09-06)**: `_build_triage_result(verdict, evidence)` takes
-ONE object now, not a `verdict`+`context` pair — the old `ContextualAssessment`
-(`make_context()` helper) is gone, folded into `make_verdict()` below.
-`stage_3_reasoning` is renamed `correlation_reasoning`.
+"""`TriageResult` tests. Priority fields come straight from `TriageVerdict`
+via `main.py::_build_triage_result(verdict, evidence)`, a thin, math-free
+assembly function — no numeric score, no separate scoring stage.
 """
 
 from __future__ import annotations
@@ -26,7 +20,6 @@ from schemas import (
     Rule,
     TriageResult,
     TriageVerdict,
-    User,
 )
 
 import main
@@ -38,7 +31,6 @@ def make_alert() -> CanonicalAlert:
         timestamp=datetime.now(timezone.utc),
         rule=Rule(name="Test Rule", uuid="x"),
         host=Host(hostname="win-test"),
-        user=User(name="tester"),
     )
 
 
@@ -48,9 +40,8 @@ def make_evidence() -> EnrichedEvidence:
 
 
 def make_verdict(**overrides) -> TriageVerdict:
-    """v6 (2026-09-06): correlation_decision/evidence_situation are required
-    fields directly on TriageVerdict now — the old separate make_context()
-    helper is folded in here."""
+    """`correlation_decision`/`evidence_situation` are required fields
+    directly on `TriageVerdict`."""
     defaults = dict(
         correlation_decision=CorrelationDecision(action="new", reasoning="correlation reasoning"),
         evidence_situation=EvidenceSituation(
@@ -94,12 +85,8 @@ class TestTriageResultPriorityFieldsComeFromVerdict:
         assert result.priority_reasoning == "P2 because confirmed malicious, no active spread"
 
     def test_investigation_gaps_comes_from_verdict(self):
-        """v5 (newdesign.md §9): investigation_gaps sources from
-        TriageVerdict.investigation_gaps. v6 (2026-09-06): there's no
-        separate ContextualAssessment.additional_investigation_gaps to leak
-        from any more — the old two-source distinction this test used to
-        guard against no longer applies, since there's only one
-        investigation_gaps field anywhere in the pipeline now."""
+        """`investigation_gaps` sources from `TriageVerdict.investigation_gaps`
+        — the only `investigation_gaps` field anywhere in the pipeline."""
         verdict = make_verdict(investigation_gaps=["the real consolidated gap"])
 
         result = main._build_triage_result(verdict, make_evidence(), None)
@@ -119,10 +106,10 @@ class TestTriageResultPriorityFieldsComeFromVerdict:
 
 
 class TestTriageResultBuilderIsPureNoMath:
-    """The whole point of the v5 redesign — no scoring formula anywhere.
-    Mutation guard: if a future change reintroduces a numeric priority
-    field, this test's field-set assertion should be revisited deliberately,
-    not silently pass."""
+    """No scoring formula anywhere in this pipeline. Mutation guard: if a
+    future change reintroduces a numeric priority field, this test's
+    field-set assertion should be revisited deliberately, not silently
+    pass."""
 
     def test_result_fields_are_all_traceable_to_verdict(self):
         verdict = make_verdict()
@@ -140,8 +127,8 @@ class TestTriageResultBuilderIsPureNoMath:
 
 
 class TestTriageResultV7Trim:
-    """2026-09-07, user-directed: the response no longer carries the raw
-    evidence dump or the flat Cortex list."""
+    """The response does not carry the raw evidence dump or a flat Cortex
+    list."""
 
     def test_gathered_evidence_field_is_gone(self):
         assert "gathered_evidence" not in TriageResult.model_fields
@@ -153,8 +140,8 @@ class TestTriageResultV7Trim:
         assert "ioc_observables" in TriageResult.model_fields
 
     def test_case_identity_fields_are_top_level(self):
-        """2026-09-07, user-directed: the case id (new or merge target) sits
-        next to alert_id, not only nested under case_action."""
+        """The case id (new or merge target) sits next to alert_id, not only
+        nested under case_action."""
         for f in ("case_id", "case_number", "is_new_case"):
             assert f in TriageResult.model_fields
 

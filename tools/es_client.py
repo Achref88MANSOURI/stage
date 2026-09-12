@@ -1,9 +1,10 @@
 """Shared async Elasticsearch transport.
 
-NOT a tool — a transport helper. It holds no query logic and returns raw JSON.
-`tools/detection_rules.py` and `tools/elasticsearch.py` both need identical
-auth, TLS and timeout handling against the same cluster; duplicating it in two
-places is how the two drift apart.
+This is a transport helper, not a tool in its own right — it holds no query
+logic and just returns raw JSON. `tools/detection_rules.py` uses it for
+auth, TLS, and timeout handling against the cluster, kept here rather than
+inline so any future ES-backed tool reuses the same handling instead of
+drifting from it.
 
 Uses `httpx` directly rather than the `elasticsearch` client library, which is
 not installed in this environment. The queries this service issues are simple
@@ -37,10 +38,8 @@ async def es_search(index: str, body: dict[str, Any], timeout: float) -> dict[st
     are responsible for converting that into a `Gap`.
 
     `allow_no_indices` / `ignore_unavailable` are set so that querying an index
-    that does not exist yet returns an empty result rather than a 404. This
-    matters directly: the Suricata and Strelka alert indices do not exist in
-    this deployment (implementation guide §0.1), and a missing index should read
-    as "no results", not as a backend failure.
+    that does not exist yet returns an empty result rather than a 404 — a
+    missing index should read as "no results", not as a backend failure.
     """
     params = {"allow_no_indices": "true", "ignore_unavailable": "true"}
     async with httpx.AsyncClient(verify=config.ES_VERIFY_TLS, timeout=timeout) as client:

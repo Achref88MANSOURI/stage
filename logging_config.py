@@ -1,24 +1,10 @@
-"""Pipeline-wide logging — installs one console handler and one rotating
-file handler, both tagging every log line with the alert it belongs to.
+"""Pipeline-wide logging setup: a console handler and a rotating file
+handler, both tagging every log line with the alert it belongs to.
 
-Not architecture v4 — a deployment addition, 2026-08-21. Before this, 12
-modules already called `logging.getLogger(__name__)` but nothing anywhere
-called `logging.basicConfig()` or configured a handler/formatter/level, so
-Python's logging defaults applied: root at WARNING, a bare "lastResort"
-handler with no timestamp and no way to tell which alert a line belonged to.
-Almost every existing call was `.warning`/`.error` (failure paths) — there
-was no visibility into the happy path at any level, because nothing was
-configured to print INFO/DEBUG at all.
-
-`configure_logging()` is called once, automatically, from `nodes/__init__.py`
-and `tools/__init__.py` — every node/tool module lives under one of those two
-packages, so importing any of them (a real run, an ad-hoc verification
-script, or pytest) triggers setup with no `main.py` dependency.
-
-Retroactive by design: `_AlertIdFilter` tags EVERY log record via the alert-
-id `ContextVar`, including the ~30 `logger.warning`/`.debug` calls that
-already existed in this codebase before this file did. None of those call
-sites needed editing to pick up the alert-id tag.
+configure_logging() runs automatically on import of stages/ or tools/, so
+it's set up before any real run, script, or test suite needs it.
+_AlertIdFilter attaches the current alert id to every record, so a plain
+logging.getLogger(__name__) call anywhere picks it up automatically.
 """
 
 from __future__ import annotations
@@ -32,23 +18,18 @@ from pathlib import Path
 
 import config
 
-# ContextVar, not a thread-local — this is an asyncio codebase, and
-# ContextVar is the one mechanism that propagates correctly through `await`
-# boundaries and concurrent tasks. A thread-local would silently show "-" (or
-# worse, a stale value from a different alert) for anything logged from
-# inside an awaited coroutine.
+# A ContextVar rather than a thread-local, since this is an asyncio codebase
+# and a thread-local wouldn't propagate correctly across await boundaries.
 alert_id_var: ContextVar[str] = ContextVar("alert_id", default="-")
 
 FORMAT = "%(asctime)s %(levelname)-8s [%(alert_id)s] %(name)s: %(message)s"
 
 _configured = False
 
-# Third-party libraries whose own DEBUG output drowns out this pipeline's —
-# confirmed live 2026-08-21: LOG_LEVEL=DEBUG produced pages of httpcore/httpx
-# wire-level frames before this list existed, burying the actual per-tool
-# lifecycle logs _guard.py adds. These stay at WARNING regardless of
-# config.LOG_LEVEL; nothing in this pipeline has needed transport-level
-# tracing yet, and anyone who does can still raise these two individually.
+# Third-party libraries whose own DEBUG output would drown out this
+# pipeline's per-tool lifecycle logs — forced to WARNING regardless of
+# config.LOG_LEVEL. Raise these individually if transport-level tracing is
+# ever needed.
 _NOISY_LOGGERS = ("httpcore", "httpx", "asyncio")
 
 
@@ -59,11 +40,9 @@ class _AlertIdFilter(logging.Filter):
 
 
 def configure_logging() -> None:
-    """Idempotent — a module-level flag, not a `root.handlers` empty-check.
-    Pytest (or another framework) may already have attached its own handlers
-    by the time this runs; this must add its own alongside them, not decide
-    "someone else configured logging, skip" and leave the console/file
-    handlers with alert-id tagging unset."""
+    """Sets up the console and file handlers. Idempotent via a module-level
+    flag rather than checking for existing handlers, since pytest or another
+    framework may already have attached its own before this runs."""
     global _configured
     if _configured:
         return
@@ -96,10 +75,9 @@ def configure_logging() -> None:
 
 @contextlib.contextmanager
 def alert_context(alert_id: str):
-    """Tag every log line emitted inside this block — and everything it
-    awaits, including tool calls several layers down — with `alert_id`.
-    Resets via the token on exit so nested or concurrent alerts never leak
-    into each other's log lines."""
+    """Tags every log line emitted inside this block, including anything it
+    awaits, with the given alert id. Resets on exit so concurrent alerts
+    don't leak into each other's logs."""
     token = alert_id_var.set(alert_id or "-")
     try:
         yield

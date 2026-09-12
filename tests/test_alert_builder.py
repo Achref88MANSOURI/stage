@@ -1,27 +1,18 @@
-"""alert_builder → CanonicalAlert.
+"""Tests for `alert_builder.build_canonical_alert`.
 
-PROVENANCE, read before trusting a green run:
+`TestRealSigmaProcessAlert` runs against a real captured Security Onion
+alert covering the `endpoint.events.process` dataset shape, which accounts
+for most of this deployment's alert volume. Every other test class runs
+against synthetic fixtures built from documented field mappings — these
+confirm the extractors map the expected paths without crashing, but don't
+prove what Security Onion actually emits for those shapes, since no real
+example has been captured yet.
 
-- `TestRealSigmaProcessAlert` runs against a REAL captured Security Onion alert.
-  It covers the `endpoint.events.process` dataset shape — 93% of this
-  deployment's alert volume — and **only** that shape.
-- Every other class runs against SYNTHETIC fixtures built from field mappings
-  (`ingest-templates.txt`, `so-alert-reference/`). They prove the extractors map
-  the documented field paths without crashing. They prove nothing about what
-  Security Onion actually emits for those shapes, because no alert of those
-  shapes has been captured in this deployment.
-
-Per implementation guide §0.1 this partial coverage is the expected state today,
-not an incomplete build.
-
-TRIMMED 2026-09-07, user-directed (alert_builder.py simplification): this
-module used to cover structured extraction of `process` detail beyond
-`command_line`, `file`, `registry`, `target_process`, `library` and
-`related_entities` — all of that was removed from `CanonicalAlert` outright
-(see `schemas/alert.py`'s docstring), so every test that exercised it is gone
-along with the code, not weakened or skipped. `TestRawAlertPassthrough` is the
-new coverage for what replaced it: `CanonicalAlert.raw_alert` carrying the
-webhook body verbatim so the single LLM call can read that detail directly.
+`CanonicalAlert` has no typed field for process, network, or user detail —
+none of it is structurally extracted. That detail reaches the single LLM
+call directly through `CanonicalAlert.raw_alert` (the webhook body carried
+verbatim) instead. See `schemas/alert.py` and `TestRawAlertPassthrough`
+below.
 """
 
 from __future__ import annotations
@@ -34,11 +25,6 @@ import pytest
 from alert_builder import build_canonical_alert
 from schemas import CanonicalAlert
 from tests.fixtures.synthetic_alerts import (
-    KRATOS_LOGIN_FLOW_ALERT,
-    POWERSHELL_ENGINE_ALERT,
-    SSH_AUTH_ALERT,
-    SSH_AUTH_ALERT_WITH_COMMUNITY_ID,
-    SURICATA_ALERT,
     SYSMON_WINLOG_ALERT,
     YARA_STRELKA_ALERT,
 )
@@ -56,10 +42,10 @@ def build(raw, hive_alert=None, alert_id="") -> CanonicalAlert:
 # REAL captured alert — endpoint.events.process ONLY
 # ===========================================================================
 class TestRealSigmaProcessAlert:
-    """REAL — Sigma / endpoint.events.process, from sigma-alert-sample.json
-    (xordump.exe Invoke-WebRequest on win-kvkmd51ggkq).
-
-    Covers this one dataset shape. Not evidence for any other shape.
+    """Runs against a real captured Sigma alert covering
+    `endpoint.events.process` (xordump.exe Invoke-WebRequest on
+    win-kvkmd51ggkq), from sigma-alert-sample.json. Covers this one
+    dataset shape only.
     """
 
     def test_identity_and_profile(self, real_sigma_process_alert):
@@ -74,10 +60,9 @@ class TestRealSigmaProcessAlert:
         assert alert.alert_id == "6qS9fp8BiUkBvoTNPeON"
 
     def test_rule_uses_structured_top_level_dict(self, real_sigma_process_alert):
-        """Regression guard for the docstring correction in _parse_rule: Sigma
-        alerts DO carry a top-level `rule` dict. If this ever falls through to
-        the description regex, uuid comes back empty and detection_rule_lookup
-        and get_fp_signal both lose their join key."""
+        """Sigma alerts carry a top-level `rule` dict. If this ever falls
+        through to the description regex instead, uuid comes back empty and
+        detection_rule_lookup and get_fp_signal both lose their join key."""
         rule = build(real_sigma_process_alert).rule
         assert rule.uuid == "5e3cc4d8-3e68-43db-8656-eaaeefdec9cc"
         assert rule.name == "Suspicious Invoke-WebRequest Execution"
@@ -93,62 +78,37 @@ class TestRealSigmaProcessAlert:
         assert host.os.type == "windows"
 
     def test_host_ip_recovered_from_beats_metadata(self, real_sigma_process_alert):
-        """event_data.host.ip is absent in this real alert; the agent address is
-        only at event_data.metadata.input.beats.host.ip. Without the fallback the
-        host IP is lost entirely for this shape."""
+        """event_data.host.ip is absent on this real alert; the agent
+        address is only at event_data.metadata.input.beats.host.ip. Without
+        this fallback the host IP would be lost for this shape."""
         assert build(real_sigma_process_alert).host.ip == ["172.20.24.99"]
-
-    def test_user(self, real_sigma_process_alert):
-        user = build(real_sigma_process_alert).user
-        assert user.name == "Administrator"
-        assert user.id.endswith("-500")  # built-in Administrator RID
-        assert user.domain == "WIN-KVKMD51GGKQ"
-
-    def test_process_command_line_only(self, real_sigma_process_alert):
-        """Process was trimmed 2026-09-07 to `command_line` only — everything
-        else it used to carry (pid, path, parent chain, code signatures, PE
-        metadata, elevation/session context) now reaches the LLM through
-        `alert.raw_alert` directly instead. See TestRawAlertPassthrough."""
-        process = build(real_sigma_process_alert).process
-        assert "xordump.exe" in process.command_line
 
     def test_process_hashes_no_longer_reach_observables_without_thehive(
         self, real_sigma_process_alert
     ):
-        """REGRESSION GUARD for the 2026-09-07 trim: process-hash extraction
-        from raw_alert (event_data.process.hash.*/pe.imphash) was removed
-        along with the rest of Process's rich fields. Without a hive_alert,
-        observables.hashes must now be empty — this real alert's process hash
-        no longer supplements it the way it used to before the trim."""
+        """Process hashes in raw_alert (event_data.process.hash.*/pe.imphash)
+        are not extracted into observables. Without a hive_alert,
+        observables.hashes must be empty."""
         hashes = build(real_sigma_process_alert).observables.hashes
         assert hashes.is_empty()
 
     def test_no_iocs_without_thehive(self, real_sigma_process_alert):
-        """Implementation guide §0.2, confirmed empirically: the raw Sigma alert
-        carries no IOCs. `ioc` exists but has no `indicators` key — the live
-        index mapping has no such field at all. The xordump URL appears only
-        inside process.command_line (and, since the 2026-09-07 trim, nowhere
-        else in the typed model — it's still visible to the LLM via
-        `raw_alert`), and extracting it here as an observable is explicitly
-        forbidden (that work lives in n8n).
-
-        If this test ever fails, someone has added IOC extraction to this repo.
-        """
+        """The raw Sigma alert carries no IOCs of its own. IOC extraction is
+        n8n's job, not this module's — the xordump URL in the command line
+        is still visible to the LLM via `raw_alert`, but must never be
+        promoted to a typed observable field here."""
         observables = build(real_sigma_process_alert).observables
         assert observables.urls == []
         assert observables.domains == []
         assert observables.external_ips == []
 
-    def test_shapes_absent_from_this_dataset_stay_none(self, real_sigma_process_alert):
-        alert = build(real_sigma_process_alert)
-        assert alert.network is None
-
     def test_alert_and_event_timestamps_both_captured_and_differ(
         self, real_sigma_process_alert
     ):
-        """~2 days apart in this real sample. Architecture §10's
-        `evidence_age_hours > 24` branch does not say which it means, so both
-        are carried and Stage 5 decides explicitly."""
+        """The alert timestamp and the underlying event timestamp are ~2
+        days apart in this sample, and are carried as separate fields
+        rather than collapsed into one, so a consumer computing evidence
+        age can choose which one it means."""
         alert = build(real_sigma_process_alert)
         assert alert.timestamp.isoformat().startswith("2026-07-22T08:55:59")
         assert alert.event_timestamp.isoformat().startswith("2026-07-20T08:52:32")
@@ -156,7 +116,7 @@ class TestRealSigmaProcessAlert:
 
     def test_thehive_observables_and_cortex_reports(self, real_sigma_process_alert):
         """The IOC path that DOES exist: hive_alert.observables, with Cortex
-        reports already attached (architecture §6)."""
+        reports already attached."""
         hive_alert = {
             "observables": [
                 {
@@ -205,14 +165,9 @@ class TestRealSigmaProcessAlert:
 
 
 class TestRealProductionEsDocument:
-    """REAL, VERBATIM — an untouched production alert document pulled from
-    `.ds-logs-detections.alerts-so-2026.08.02-000147` on 2026-08-08.
-
-    Higher authority than the webhook sample: nothing has been through a capture
-    or edit step. Same rule, different alert instance (deeper process ancestry —
-    though `process.ancestry` itself no longer exists as a typed field after
-    the 2026-09-07 trim; the depth is no longer something this suite asserts
-    on, since nothing downstream reads it any more).
+    """An untouched production Security Onion alert document, pulled
+    directly from the live alerts index rather than a webhook capture.
+    Same rule as the webhook sample, a different alert instance.
     """
 
     def test_parses_from_the_raw_index_document(self, real_es_alert_source):
@@ -222,18 +177,15 @@ class TestRealProductionEsDocument:
         assert alert.event_dataset == "endpoint.events.process"
         assert alert.rule.uuid == "5e3cc4d8-3e68-43db-8656-eaaeefdec9cc"
         assert alert.host.hostname == "win-kvkmd51ggkq"
-        assert alert.user.name == "Administrator"
 
     def test_ioc_present_in_real_production_data_and_still_ignored(
         self, real_es_alert_source
     ):
-        """The definitive version of the ioc guard.
-
-        `so-ioc-normalize` is live in this deployment and stamps `ioc.*` onto
-        100% of alerts since 2026-07-16, so this untouched production document
-        genuinely contains it. `ioc.source_engine` is set from `ctx.event.module`
-        by that pipeline, which is exactly why it can never corroborate
-        `event.module` — and why engine detection must read `event.module`.
+        """An ingest add-on in this deployment stamps `ioc.*` onto real
+        alerts, so this production document genuinely contains it.
+        `ioc.source_engine` is itself derived from `event.module`, so it
+        can never independently corroborate it — engine detection must
+        read `event.module` directly instead.
         """
         assert "ioc" in real_es_alert_source
         assert real_es_alert_source["ioc"]["source_engine"] == "sigma"
@@ -247,11 +199,8 @@ class TestRealProductionEsDocument:
     def test_no_iocs_reach_observables_from_production_document(
         self, real_es_alert_source
     ):
-        """REGRESSION GUARD for the 2026-09-07 trim, updated from its
-        pre-trim form: this used to assert the process hash still reached
-        observables.hashes ("not an IOC extraction"). That extraction path is
-        gone along with the rest of Process's rich fields — hashes must now be
-        empty here too, since no hive_alert is given."""
+        """Hashes are never extracted from raw_alert into observables — with
+        no hive_alert given, observables.hashes must be empty here."""
         observables = build(real_es_alert_source).observables
         assert observables.urls == []
         assert observables.domains == []
@@ -263,84 +212,28 @@ class TestRealProductionEsDocument:
 # SYNTHETIC — every shape below is unvalidated against real data
 # ===========================================================================
 class TestSyntheticWinlogShapes:
-    """SYNTHETIC — winlog / powershell / ssh / kratos telemetry shapes."""
+    """Synthetic fixture covering the native Windows Event Log (winlog)
+    telemetry shape."""
 
     def test_sysmon_winlog(self):
-        """event_data.winlog.process only ever carried a bare `pid` (no
-        command_line/name equivalent, per the pre-trim docstring) — the
-        2026-09-07 trim removed that extraction path entirely along with the
-        rest of Process's non-command_line fields, so `process` is now None
-        for this shape."""
+        """Confirms host identity and event_dataset resolve correctly for
+        the winlog shape (_extract_winlog_host), distinct from the
+        Elastic-Defend/Sysmon-via-elastic-agent shape
+        _extract_host_from_event_data handles."""
         alert = build(SYSMON_WINLOG_ALERT)
         assert alert.host.hostname == "win-kvkmd51ggkq"
-        assert alert.user.name == "SYSTEM"
-        assert alert.user.id == "S-1-5-18"
-        assert alert.process is None
         assert alert.event_dataset == "windows.sysmon_operational"
-
-    def test_powershell_engine_state_synthesized(self):
-        """No process exists for an engine-state event; the extractor
-        synthesizes a descriptive command_line rather than inventing a pid."""
-        process = build(POWERSHELL_ENGINE_ALERT).process
-        assert "powershell engine" in process.command_line
-        assert "None -> Available" in process.command_line
-
-    def test_ssh_auth_synthesized_and_network_from_event_data(self):
-        alert = build(SSH_AUTH_ALERT)
-        assert alert.process.command_line == "ssh Accepted (publickey)"
-        assert alert.network.src_ip == "10.20.30.40"
-        assert alert.network.src_port == 51234
-
-    def test_community_id_from_nested_event_data_network(self):
-        """Gap #5, synthetic-only (no real Sysmon network_connection alert
-        captured yet — see fixture docstring). Suricata's top-level
-        network.community_id is covered by TestRealSuricataPath; this covers
-        the nested event_data.network.community_id fallback path."""
-        alert = build(SSH_AUTH_ALERT_WITH_COMMUNITY_ID)
-        assert alert.network.community_id == "1:synthetic-community-id-hash="
-
-    def test_kratos_login_flow_synthesized_with_host_port_split(self):
-        alert = build(KRATOS_LOGIN_FLOW_ALERT)
-        assert "POST /self-service/login" in alert.process.command_line
-        assert "state=choose_method" in alert.process.command_line
-        assert alert.network.src_ip == "203.0.113.9"
-        assert alert.network.src_port == 44321
-
-
-class TestSyntheticSuricataPath:
-    # NOTE: this fixture now covers only what the real fixture below doesn't
-    # (a different rule/uuid, an IPv6 destination, network.initiated — see
-    # synthetic_alerts.py's comment). `transport` was corrected 2026-08-18 to
-    # "TCP" (uppercase) to match real data; this test's assertion follows.
-    def test_network_threat_profile_and_network_fields(self):
-        alert = build(SURICATA_ALERT)
-        assert alert.source_engine == "suricata"
-        assert alert.investigation_profile == "network_threat"
-        assert alert.network.src_ip == "172.20.24.99"
-        assert alert.network.dst_ip == "185.53.178.50"
-        assert alert.network.dst_port == 443
-        assert alert.network.protocol == "TCP"
-        assert alert.network.initiated is True
-
-    def test_no_endpoint_context(self):
-        alert = build(SURICATA_ALERT)
-        assert alert.process is None
 
 
 # ===========================================================================
 # REAL captured Suricata alert — network_threat profile
 # ===========================================================================
 class TestRealSuricataPath:
-    """REAL — suricata.alert, from `tests/fixtures/suricata-alert-real.json`
-    ("GPL ATTACK_RESPONSE id check returned root", SID 2100498). Re-confirmed
-    live 2026-08-18 against a freshly-fired alert for the same rule in this
-    deployment's `logs-suricata.alerts-so` — see conftest.py's
-    `real_suricata_alert_hit` docstring for the full provenance note,
-    including why this alert has never actually reached `/triage` (Gap 0,
-    CLAUDE.md).
-
-    Covers this one dataset shape (network_threat / suricata.alert) and only
-    that shape — same discipline `TestRealSigmaProcessAlert` follows above.
+    """Runs against a real captured suricata.alert document
+    ("GPL ATTACK_RESPONSE id check returned root", SID 2100498, from
+    tests/fixtures/suricata-alert-real.json — see conftest.py for why this
+    alert has never actually reached `/triage`). Covers the network_threat
+    profile only, same discipline as `TestRealSigmaProcessAlert` above.
     """
 
     def test_identity_and_profile(self, real_suricata_alert_source):
@@ -349,10 +242,9 @@ class TestRealSuricataPath:
         assert alert.investigation_profile == "network_threat"
 
     def test_event_dataset_from_top_level_fallback(self, real_suricata_alert_source):
-        """Regression test for the alert_builder.py fix: Suricata has no
-        event_data, so event_dataset must fall back to the top-level
-        raw_alert.event.dataset — it must NOT be None just because the
-        Sigma-shaped nested path doesn't exist on this alert."""
+        """Suricata alerts have no event_data, so event_dataset must fall
+        back to the top-level raw_alert.event.dataset rather than coming
+        back None just because the Sigma-shaped nested path is absent."""
         alert = build(real_suricata_alert_source)
         assert alert.event_dataset == "suricata.alert"
 
@@ -361,45 +253,23 @@ class TestRealSuricataPath:
         assert alert.rule.uuid == "2100498"
         assert alert.rule.name == "GPL ATTACK_RESPONSE id check returned root"
 
-    def test_network_fields(self, real_suricata_alert_source):
-        alert = build(real_suricata_alert_source)
-        assert alert.network.src_ip == "192.168.1.11"
-        assert alert.network.src_port == 6200
-        assert alert.network.dst_ip == "192.168.1.175"
-        assert alert.network.dst_port == 39391
-        assert alert.network.protocol == "TCP"
-
-    def test_community_id(self, real_suricata_alert_source):
-        """Gap #5, tier-1 verified 2026-08-19: raw_alert.network.community_id
-        is real and populated on this fixture — the pivot key for a future
-        elasticsearch_suricata_flow_context tool to correlate this alert
-        against companion EVE-log documents (DNS/HTTP/TLS/flow)."""
-        alert = build(real_suricata_alert_source)
-        assert alert.network.community_id == "1:4VUkJupYhA6RP+xhGL5c62H+GNQ="
-
     def test_no_endpoint_context(self, real_suricata_alert_source):
-        """Confirmed on the real alert, not assumed: no host/user/process
-        fields exist anywhere on a Suricata document."""
+        """No host fields exist anywhere on a Suricata document."""
         alert = build(real_suricata_alert_source)
         assert alert.host is None
-        assert alert.user is None
-        assert alert.process is None
 
 
 class TestRuleIdentityRegressionGuards:
-    """Salvaged from the pre-2026-09-07 `TestRealSysmonRegistryPath` class,
-    which was otherwise removed along with `Registry`/structured-registry
-    extraction — this one test is about `_parse_rule`'s collision guard
-    (gap #11), unrelated to the registry field itself, and still load-bearing:
-    `_parse_rule` is untouched by the alert_builder.py simplification."""
+    """`_parse_rule`'s collision guard: Sysmon's own internal RuleName config
+    tag lives at the same-looking path as the real fired Sigma rule name and
+    must not be confused with it."""
 
     def test_rule_identity_not_confused_with_sysmon_internal_rule_name(
         self, real_sysmon_registry_alert_source
     ):
-        """Gap #11's live citation: event_data.rule.name on this real alert
-        is "T1183,IFEO" (Sysmon's own internal RuleName tag) — completely
-        different from the real fired Sigma rule name. Regression guard that
-        _parse_rule picks the right one."""
+        """event_data.rule.name on this alert is "T1183,IFEO" (Sysmon's own
+        internal RuleName tag), completely different from the actually
+        fired Sigma rule name — confirms _parse_rule picks the right one."""
         raw = real_sysmon_registry_alert_source
         assert raw["event_data"]["rule"]["name"] == "T1183,IFEO"
         alert = build(raw)
@@ -408,26 +278,20 @@ class TestRuleIdentityRegressionGuards:
 
 
 class TestSyntheticYaraPath:
-    # NOTE: YARA path — unit-tested against synthetic fixture only, no live SO
-    # alert exists yet to validate against (implementation guide §0.1).
-    #
-    # TRIMMED 2026-09-07: this class used to also assert on structured
-    # `alert.file` extraction (name/mime_type) and observable hashes derived
-    # from raw_alert. Both were removed along with `File`/the rest of the
-    # rich-process/file extraction — YARA_STRELKA_ALERT's `file`/`hash`/`scan`
-    # content still exists in `raw_alert` verbatim for the LLM to read (see
-    # TestRawAlertPassthrough), it's just no longer separately extracted or
-    # asserted on here.
+    # Tested against a synthetic fixture only; no live YARA alert has been
+    # captured to validate against yet. YARA_STRELKA_ALERT's file/hash/scan
+    # content reaches the LLM through raw_alert verbatim (see
+    # TestRawAlertPassthrough) rather than a separately extracted field.
     def test_malicious_file_profile_and_top_level_hashes(self):
         alert = build(YARA_STRELKA_ALERT)
-        # event.module is "strelka" for Security Onion's file-extraction path.
-        # PROFILE_BY_ENGINE maps both "strelka" and "yara" to malicious_file,
-        # because neither spelling can be confirmed live in this deployment.
+        # event.module is "strelka" for Security Onion's file-extraction
+        # path; PROFILE_BY_ENGINE maps both "strelka" and "yara" spellings
+        # to malicious_file.
         assert alert.source_engine == "strelka"
         assert alert.investigation_profile == "malicious_file"
-        # No hive_alert given — hashes never reach observables from raw_alert
-        # any more (see TestRealSigmaProcessAlert's equivalent regression
-        # guard above).
+        # No hive_alert given — process/file hashes are not extracted from
+        # raw_alert into observables (see TestRealSigmaProcessAlert's
+        # equivalent guard above).
         assert alert.observables.hashes.is_empty()
 
     def test_rule_uuid_equals_rule_name_for_yara(self):
@@ -438,22 +302,21 @@ class TestSyntheticYaraPath:
 
 
 # ===========================================================================
-# raw_alert passthrough — replaces the removed structured process/file/
-# registry/target_process/library/related_entities extraction, 2026-09-07.
+# raw_alert passthrough
 # ===========================================================================
 class TestRawAlertPassthrough:
     """`CanonicalAlert.raw_alert` carries the original webhook body verbatim
-    so the single LLM call (`nodes/triage.py`, via
+    so the single LLM call (`stages/triage.py`, via
     `prompts/triage_agent.py::build_user_prompt`) can read process/file/
-    registry/etc. detail directly, instead of through a typed field only it
-    used to consume. See schemas/alert.py::CanonicalAlert's docstring."""
+    registry/etc. detail directly, without needing a dedicated typed field
+    for each. See schemas/alert.py::CanonicalAlert's docstring."""
 
     def test_raw_alert_carried_verbatim_for_real_sigma_alert(
         self, real_sigma_process_alert
     ):
         alert = build(real_sigma_process_alert)
         assert alert.raw_alert == real_sigma_process_alert
-        # Specifically confirms detail no longer structurally extracted (the
+        # Confirms detail not structurally extracted into a typed field (the
         # full event_data.process object, not just command_line) is still
         # reachable from raw_alert.
         assert (
@@ -485,7 +348,6 @@ class TestDegradesRatherThanRaises:
         alert = build({})
         assert alert.rule.name == "unknown"
         assert alert.host is None
-        assert alert.process is None
         assert alert.observables.hashes.is_empty()
 
     def test_alert_with_only_event_data_scaffolding(self):
@@ -502,14 +364,13 @@ class TestDegradesRatherThanRaises:
                 "source": "security-onion",
                 "rule": "not-a-dict",
                 "event": None,
-                "event_data": {"host": "nope", "process": ["also", "nope"], "user": 42},
+                "event_data": {"host": "nope"},
                 "ioc": "string-not-dict",
                 "tags": None,
             }
         )
         assert isinstance(alert, CanonicalAlert)
         assert alert.host is None
-        assert alert.process is None
 
     def test_scalar_where_array_expected(self):
         """ECS array-typed fields are routinely emitted as bare scalars when
@@ -538,14 +399,10 @@ class TestDegradesRatherThanRaises:
         assert alert.investigation_profile == "network_threat"
 
     def test_ioc_field_is_ignored_entirely(self):
-        """REGRESSION GUARD. `ioc.*` is NOT a Security Onion field. It came from
-        a custom development-time ingest pipeline that set
-        `ioc.source_engine = ctx.event.module` — derived from event.module, so
-        it can never corroborate it — and it is mapped in only 1 of the 24 live
-        backing indices.
-
-        If this test fails, someone has reintroduced a dependency on a field
-        that does not exist in production Security Onion alerts."""
+        """`ioc.*` is not a native Security Onion field — a custom ingest
+        add-on sets `ioc.source_engine = ctx.event.module`, derived from
+        event.module, so it can never independently corroborate it. This
+        guards against reintroducing a dependency on `ioc.*`."""
         alert = build(
             {
                 "ioc": {
@@ -574,8 +431,9 @@ class TestDegradesRatherThanRaises:
         assert alert.observables.hashes.is_empty()
 
     def test_missing_timestamp_defaults_to_now_but_event_timestamp_stays_none(self):
-        """"unknown" must stay distinguishable from "just happened" for the
-        event timestamp, since §10 may use it for evidence age."""
+        """"Unknown" must stay distinguishable from "just happened" for the
+        event timestamp, since downstream reasoning may use it to judge
+        evidence age."""
         alert = build({})
         assert alert.timestamp is not None
         assert alert.event_timestamp is None
@@ -598,12 +456,11 @@ class TestDegradesRatherThanRaises:
 # ===========================================================================
 @pytest.fixture(scope="module")
 def hive_alert() -> dict:
-    """REAL — the 4 observables of alert ~4661456, captured 2026-08-13 via the
-    stock `getAlert -> observables -> page` projection (tools/thehive.py; the
-    custom getAlertWithObservables Function this used to come from is gone —
-    see that module's docstring). Chosen because it's the richest of the three
-    alerts on this instance: real VirusTotal reports on the URL observable,
-    not just OpenCTI's "Not found"."""
+    """The 4 real observables of alert ~4661456, fetched via the stock
+    `getAlert -> observables -> page` projection (tools/thehive.py) — the
+    richest of the alerts available on this instance, with real VirusTotal
+    reports on the URL observable rather than only OpenCTI's "Not
+    found"."""
     payload = json.loads(
         (Path(__file__).parent / "fixtures" / "thehive_real.json").read_text()
     )
@@ -611,18 +468,16 @@ def hive_alert() -> dict:
 
 
 class TestCortexTaxonomyVerdicts:
-    """REAL — the four observables of alert ~4661456, captured 2026-08-13.
+    """Runs against the four real observables of alert ~4661456.
 
-    Real reports on this instance are simpler than the 2026-08-09 capture
-    that originally motivated the verdict-collapsing fix: no observable here
-    carries duplicate rows or a context-row/verdict-row split (VT ran only on
-    the URL, and its two rows — Scan and GetReport — each carry a single
-    `level: malicious` row at a low 1/92 ratio; OpenCTI's rows are all
-    `level: info`, "Not found"; the github.com domain has no reports at all).
-    The duplicate-row and context-vs-verdict scenarios that the 2026-08-09 fix
-    was actually about are still covered below, but as SYNTHETIC unit tests on
-    `_summarize_taxonomies` directly — this instance's current real data no
-    longer happens to exhibit that shape.
+    The real reports on this instance are simple — no duplicate rows or
+    context-row/verdict-row split appears in this data (VT ran only on the
+    URL, both its rows carry a single `level: malicious` at a low 1/92
+    ratio; OpenCTI's rows are all `level: info`, "Not found"; the
+    github.com domain has no reports at all). The duplicate-row and
+    context-vs-verdict scenarios `_summarize_taxonomies` also needs to
+    handle are covered separately below with synthetic input, since this
+    real data doesn't happen to exercise them.
     """
 
     def results_by_observable(self, real_sigma_process_alert, hive_alert):
@@ -684,8 +539,8 @@ class TestCortexTaxonomyVerdicts:
         assert any(k[0].startswith("1c84c863") for k in results)
 
     def test_context_row_does_not_silently_win_over_the_real_verdict(self):
-        """SYNTHETIC, modelled on the real 2026-08-09 github.com shape (this
-        instance's current data no longer has an observable with this split —
+        """SYNTHETIC, modelled on a real observed VT taxonomy shape (this
+        instance's current data doesn't have an observable with this split —
         see class docstring). VT's actual pattern: a context row
         ("56 resolution(s)") happens to be tagged `level: malicious`, while
         the real detection-ratio row ("0/91") is tagged `level: info`. Under
@@ -703,7 +558,7 @@ class TestCortexTaxonomyVerdicts:
         assert "0/91 (info)" in details
 
     def test_duplicate_taxonomy_rows_are_collapsed(self):
-        """SYNTHETIC, modelled on the real 2026-08-09 payload, which carried
+        """SYNTHETIC, modelled on a real observed payload that carried
         `VT:GetReport=3/97` twice (this instance's current data has no
         duplicated row — see class docstring)."""
         from alert_builder import _summarize_taxonomies
@@ -726,11 +581,10 @@ class TestCortexTaxonomyVerdicts:
         assert verdict == ["suspicious"]
 
     def test_ratio_count_no_longer_drives_the_verdict(self):
-        """THE RETIRED BEHAVIOR, kept as a guard against reintroducing it. A
-        high detection count with an explicit `info` label must NOT be
-        promoted to malicious/suspicious — that promotion is exactly the
-        scoring judgement this function no longer makes. The analyzer's own
-        label wins, even when it looks under-cautious next to the number."""
+        """A high detection count with an explicit `info` label must NOT be
+        promoted to malicious/suspicious — this function makes no scoring
+        judgement of its own. The analyzer's own label wins, even when it
+        looks under-cautious next to the number."""
         from alert_builder import _summarize_taxonomies
 
         verdict, details = _summarize_taxonomies(

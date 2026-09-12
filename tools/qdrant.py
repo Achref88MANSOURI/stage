@@ -1,53 +1,27 @@
-"""`retrieve_mitre` / `retrieve_playbooks` — Stage 2 RAG retrieval,
-architecture §7.
+"""`retrieve_mitre` — RAG retrieval against Qdrant, grounding the triage LLM's
+MITRE ATT&CK technique output in a real corpus instead of letting it invent
+technique IDs cold.
 
-`retrieve_cve` (`cve_context` collection) was REMOVED 2026-09-06,
-user-directed, along with `CveMatch` and `EnrichedEvidence.cve_matches`.
-`retrieve_incidents` (`incident_history` collection, the deployment-added
-4th collection) was ALSO REMOVED 2026-09-06, user-directed, along with
-`IncidentMatch` and `EnrichedEvidence.incident_matches` — this was the
-historical TP/FP context source that itself had only just replaced TheHive's
-`search_closed_cases_by_rule` (removed earlier the same day). There is now
-NO historical-TP/FP-context source anywhere in this pipeline;
-`prompts/analyst_agent.py`'s `historical_context` field is gone with it, not
-replaced. See `nodes/rag.py`'s module docstring for the Stage-2-orchestration
-side of both removals.
+Deterministic Python, not an LLM-callable tool — no tool schema is exposed
+anywhere in this module. The evidence-gathering node calls this function
+before the LLM runs and folds the result into `EnrichedEvidence`, which the
+single-shot LLM call then reads as plain data. This matches every other
+`tools/*.py` module in this repo: neither LLM call in this pipeline has tool
+access.
 
-Deterministic Python, NOT an LLM-callable tool — no tool schema is exposed
-anywhere in this module. `nodes/rag.py` calls these functions BEFORE either
-LLM stage runs and assembles the results into `EnrichedEvidence`; Stage 3's
-single-shot call then reads that as plain data. This matches every other
-`tools/*.py` in this repo and CLAUDE.md's hard constraint that neither LLM
-call has tool access.
+Qdrant lives at `config.QDRANT_URL`; embeddings come from
+`config.EMBEDDING_API_URL`, a separate HTTP microservice colocated on the
+same host (`POST {"text": ...} -> {"embedding": [float x 1024]}`,
+BAAI/bge-m3, 1024-dim Cosine) — the model is not loaded in-process, so there
+is nothing to initialize once on this side; every call below is a fresh,
+cheap HTTP round trip, matching every other `tools/*.py`'s fresh-client-per-
+call convention.
 
-VERIFIED AGAINST THE LIVE BACKEND 2026-08-16. Qdrant at `config.QDRANT_URL`,
-embedding microservice at `config.EMBEDDING_API_URL`
-(`POST {"text": ...} -> {"embedding": [float x 1024]}`, BAAI/bge-m3, 1024-dim
-Cosine on every collection). Real collections this module queries, point
-counts confirmed live:
-
-    mitre_techniques   697 points
-    soc_playbooks       48 points  (8 runbooks x ~6 sections)
-
-(`cve_context`, 6358 points, and `incident_history`, 2 points, both existed
-and were queried before their respective 2026-09-06 removals above — both
-collections are untouched in Qdrant, just no longer read from here.)
-`triage_kb` (2412 points) also exists and is a known test artifact — never
-queried by this module.
-
-TWO THINGS THE REAL BACKEND DOES THAT AN ILLUSTRATIVE SPEC DID NOT SAY:
-
-1. Real point payloads for mitre_techniques/soc_playbooks do NOT match
-   architecture §7's illustrative example fields — see the corrected
-   `MitreCandidate` / `PlaybookMatch` docstrings in `schemas/evidence.py`.
-   This module maps the REAL payload keys.
-2. The embedding model is not loaded in-process (architecture §7's "loaded
-   ONCE at service startup as a module-level singleton" assumes an in-process
-   model) — it's its own already-running HTTP microservice, colocated on the
-   same host as Qdrant. There is nothing to initialize once on this side;
-   every call below is a fresh, cheap HTTP round trip, matching every other
-   `tools/*.py`'s own fresh-client-per-call convention (see
-   `tools/opencti.py`).
+Queries the `mitre_techniques` collection (697 points). Real point payloads
+have no `description`, `detection_guidance`, `mitigations` or
+`priority_score_0_5` field, and `tactic` is a list, not a single string (a
+technique can belong to more than one tactic) — see the `MitreCandidate`
+docstring in `schemas/evidence.py` for the full mapped shape.
 """
 
 from __future__ import annotations
@@ -60,20 +34,17 @@ from typing import Any, Callable, TypeVar
 import httpx
 
 import config
-from schemas import Gap, MitreCandidate, PlaybookMatch
+from schemas import Gap, MitreCandidate
 
 logger = logging.getLogger(__name__)
 
 SOURCE = "qdrant"
 TOOL_NAME_MITRE = "retrieve_mitre"
-TOOL_NAME_PLAYBOOKS = "retrieve_playbooks"
 
 MITRE_COLLECTION = "mitre_techniques"
-PLAYBOOK_COLLECTION = "soc_playbooks"
 
-# architecture §7: broader recall for MITRE, tighter for playbooks.
+# A lower threshold favors broader recall for MITRE technique matching.
 MITRE_MIN_SIMILARITY = 0.5
-PLAYBOOK_MIN_SIMILARITY = 0.55
 
 T = TypeVar("T")
 
@@ -111,8 +82,8 @@ async def _search(
 ) -> list[dict[str, Any]]:
     """POST config.QDRANT_URL/collections/{collection}/points/search. Raises
     on transport/HTTP error — the caller converts that into a Gap.
-    `score_threshold` excludes low-similarity hits entirely (verified live —
-    they are not returned with a low score, they are absent)."""
+    `score_threshold` excludes low-similarity hits entirely — they are not
+    returned with a low score, they are absent from the response."""
     body = {
         "vector": vector,
         "limit": top_k,
@@ -154,19 +125,6 @@ def _mitre_from_hit(hit: dict[str, Any]) -> MitreCandidate:
     )
 
 
-def _playbook_from_hit(hit: dict[str, Any]) -> PlaybookMatch:
-    payload = hit.get("payload") or {}
-    return PlaybookMatch(
-        playbook_id=payload.get("runbook_id", ""),
-        title=payload.get("title", ""),
-        category=payload.get("category", ""),
-        section=payload.get("section", ""),
-        runbook_section_id=payload.get("runbook_section_id", ""),
-        document_text=payload.get("document_text", ""),
-        score=float(hit.get("score", 0.0)),
-    )
-
-
 async def _retrieve(
     *,
     collection: str,
@@ -177,12 +135,11 @@ async def _retrieve(
     tool: str,
     timeout: float | None,
 ) -> tuple[list[T], Gap | None]:
-    """Shared NEVER-RAISES body for both retrieve_* functions. Returns
-    `(hits, Gap | None)`:
+    """Shared NEVER-RAISES retrieval body. Returns `(hits, Gap | None)`:
 
     - hits found or genuinely none clear score_threshold -> `(list, None)` —
       an empty list with no Gap is a real, fully successful result, same
-      convention as every other Stage 1/2 tool in this repo.
+      convention as every other tool in this repo.
     - nothing to embed        -> `([], Gap)`, network never touched
     - embed/search/timeout failure -> `([], Gap)` with the transport reason
     """
@@ -237,14 +194,12 @@ async def _retrieve(
 async def retrieve_mitre(
     query_text: str, top_k: int = 5, timeout: float | None = None
 ) -> tuple[list[MitreCandidate], Gap | None]:
-    """Always called (architecture §7): grounds the LLM's MITRE technique
-    output against the real corpus instead of letting it invent IDs cold.
-    `query_text` should be the single most behaviorally specific observation
-    from the evidence, NOT the full evidence package concatenated — a
-    multi-behavior blob collapses recall on the technique that actually
-    matters (see nodes/rag.py, not yet built, for query construction).
+    """Always called. `query_text` should be the single most behaviorally
+    specific observation from the evidence, NOT the full evidence package
+    concatenated — a multi-behavior blob collapses recall on the technique
+    that actually matters (see `stages/rag.py` for query construction).
 
-    NEVER RAISES. See `_retrieve` for the `(result, Gap | None)` contract.
+    Never raises; see `_retrieve` for the `(result, Gap | None)` contract.
     """
     return await _retrieve(
         collection=MITRE_COLLECTION,
@@ -253,27 +208,5 @@ async def retrieve_mitre(
         score_threshold=MITRE_MIN_SIMILARITY,
         map_hit=_mitre_from_hit,
         tool=TOOL_NAME_MITRE,
-        timeout=timeout,
-    )
-
-
-async def retrieve_playbooks(
-    query_text: str, top_k: int = 3, timeout: float | None = None
-) -> tuple[list[PlaybookMatch], Gap | None]:
-    """Conditional (architecture §7) — the caller (`nodes/rag.py`) decides
-    whether the alert matches a known playbook trigger pattern before calling
-    this; this function always performs the query it's asked for. Multiple
-    sections (Detection, Investigation Steps, Containment, ...) sharing one
-    `playbook_id` in a single result set is expected, not a duplicate.
-
-    NEVER RAISES. See `_retrieve` for the `(result, Gap | None)` contract.
-    """
-    return await _retrieve(
-        collection=PLAYBOOK_COLLECTION,
-        query_text=query_text,
-        top_k=top_k,
-        score_threshold=PLAYBOOK_MIN_SIMILARITY,
-        map_hit=_playbook_from_hit,
-        tool=TOOL_NAME_PLAYBOOKS,
         timeout=timeout,
     )

@@ -1,40 +1,30 @@
-"""Combined single-call prompt + output schema — v6 redesign (SOC-3s v6
-spec, 2026-09-06). Replaces `prompts/context_agent.py` (Stage 3, deleted)
-and `prompts/analyst_agent.py` (Stage 4, deleted).
+"""The triage LLM call's prompt and output schema.
 
-Exports: `SYSTEM_PROMPT` (static — the union of old Stage 3's five tasks and
-old Stage 4's verdict/priority tasks, six tasks total), `build_user_prompt`
-(the full `EnrichedEvidence`, no truncation, no firewall — this single call
-is now architecture's one place meant to see everything Stage 1+2 produced
-AND make the operational call, see `schemas/verdict.py`'s module docstring
-for the accepted prompt-injection-surface tradeoff this is), and
-`build_triage_verdict_schema(evidence)`.
+Exports `SYSTEM_PROMPT` (static — six tasks: refine the MITRE mapping,
+judge correlation, assess the evidence situation, extract actionable
+observables, produce the verdict, assign priority), `build_user_prompt`
+(dumps the full `EnrichedEvidence`, since this is the one call that sees
+everything gathered), and `build_triage_verdict_schema(evidence)`.
 
-**The schema is hand-inlined (`_BASE_SCHEMA`) and must stay that way** — same
-non-negotiable reason both deleted prompt modules already established: a
-`$ref`-based schema in `response_format: {"type": "json_schema", ...}` hung
-Ollama's grammar compiler for 280+ seconds in live testing; the identical
-schema hand-inlined completed in under 70s. `tests/test_triage.py::
-TestSchemaStaysInSync` guards against this schema and `TriageVerdict`
-silently drifting apart on a future field change.
+The schema (`_BASE_SCHEMA`) is hand-inlined rather than generated from the
+`TriageVerdict` model, and needs to stay that way: a `$ref`-based schema
+passed to `response_format: json_schema` can hang a grammar-constrained
+decoder for minutes, while the identical schema hand-inlined completes
+normally. `tests/test_triage.py::TestSchemaStaysInSync` guards against the
+two drifting apart as fields change.
 
-**Why the schema is built per-call, not a static constant.** Same
-live-verified bug class the old Stage 3 fix closed (CLAUDE.md's "Observed
-Stage 3 output quality note", 2026-08-16): the model must never be free to
-invent a `merge_into_case_id` that isn't a real open case. `merge_into_case_id`'s
-enum is constrained to this call's actual `evidence.open_cases` ids (plus
-`null`), and `correlation_decision.action`'s enum drops `"merge"` entirely
-when there are no open cases to merge into — identical mechanism to before.
+The schema is also built fresh per call rather than kept as a constant, so
+the model can never invent a `merge_into_case_id` that isn't a real open
+case: its enum is constrained to `evidence.open_cases`'s actual ids (plus
+`null`), and `correlation_decision.action` drops `"merge"` entirely when
+there are no open cases.
 
-**A structural limitation this collapse introduces, not present in the old
-two-call design**: `recommended_action`'s enum can no longer be narrowed to
-match `correlation_decision.action` the way old Stage 4's schema could,
-because both fields are produced in the SAME response — which branch the
-model will pick isn't known before the schema is sent. When open cases
-exist, `recommended_action`'s enum stays the full 5-value set regardless of
-which `action` gets chosen; `nodes/triage.py::_validate_recommended_action`
-is the compensating post-parse consistency check. See `schemas/verdict.py`'s
-module docstring for the full account.
+One limitation this doesn't fully close: `recommended_action` and
+`correlation_decision.action` come from the same response, so
+`recommended_action`'s enum can't always be narrowed to match whichever
+branch of `action` the model ends up choosing — when open cases exist, all
+5 values stay legal. `stages/triage.py::_validate_recommended_action`
+checks the two are consistent after parsing.
 """
 
 from __future__ import annotations
@@ -53,7 +43,8 @@ Your job has six parts:
 2. Judge correlation — does this alert merge with existing cases, and is it a kill-chain
    progression?
 3. Assess the evidence situation — what's reliable, what's missing, what the analyst must
-   verify
+   verify — AND write evidence_analysis, your narrative reading of what the concrete
+   evidence actually shows (see TASK 3 and the EVIDENCE ANALYSIS note below)
 4. Extract observable fields requiring response action — see TASK 4 below
 5. Produce the verdict — likelihood, impact, verdict, reasoning, summary, recommended action
 6. Assign priority — priority_band, priority_reasoning, investigation_gaps — see the
@@ -77,9 +68,17 @@ noise. Base extraction and criticality on entries whose verdict is non-empty. An
 no cortex_results entries at all means no observable had any analyzer report — genuinely no
 data, weigh it as neutral, not as evidence of either verdict.
 
-evidence_citations must each be a short, specific pointer to a field actually present in the
-evidence above (e.g. "rule_context.severity=high", "canonical_alert.cortex_results[0].verdict
-=malicious") — never a paraphrase, never something not traceable to a real field.
+EVIDENCE ANALYSIS (evidence_analysis field):
+Write a concise analytical narrative — a few short paragraphs — of what the concrete evidence
+in this package actually shows. This is your reasoning about the evidence itself, NOT a list
+of field pointers and NOT the reliability assessment (that is evidence_situation / TASK 3).
+Cover, where the evidence supports it: what the rule matched and why it fired; the observed
+process / command-line / network / file / registry activity and whether it looks benign or
+malicious; the Cortex analyzer results (canonical_alert.cortex_results — name the analyzer
+and its verdict for each non-empty entry, and say explicitly when analyzers returned nothing
+adverse or never ran); asset and user context; and any correlation with open cases or
+recent related alerts. Ground every statement in a field that is actually present — do not
+speculate beyond the evidence.
 
 TASK 4 — EXTRACT OBSERVABLE FIELDS REQUIRING RESPONSE ACTION:
 Do not catalogue every IOC present in the evidence. Answer only: what would a responder need
@@ -104,11 +103,10 @@ it will be discarded as a hallucination.
 
 TASK 3 — EVIDENCE SITUATION ASSESSMENT:
 
-For each of the following 6 evidence sources, assess its status and what that status means
+For each of the following 5 evidence sources, assess its status and what that status means
 for the reliability of this triage. Produce one entry per source.
 
-Sources to assess: fp_signal, rule_context, open_cases, asset_context, related_alerts_1h,
-opencti_enrichment.
+Sources to assess: fp_signal, rule_context, open_cases, asset_context, opencti_enrichment.
 
 For each source, produce:
 
@@ -162,7 +160,7 @@ Before assigning, answer three questions from the evidence:
 QUESTION A — Has a benign explanation been established?
   YES if any of these apply:
     - rule_context.falsepositives[] explicitly describes this behavior as a known FP
-    - fp_signal shows high FP count and zero historical TPs for this rule on this host
+    - fp_signal shows a high false-positive count for this rule
     - canonical_alert.cortex_results is non-empty AND all verdict fields are empty
       (analyzers checked and found nothing)
     - process/user/asset context clearly matches a documented known-good pattern
@@ -182,10 +180,8 @@ QUESTION C — Is active progression or high-impact signal present?
     - your own refined_mitre_mapping (TASK 1) shows tactic = lateral-movement, exfiltration,
       impact, or credential-access
     - your own correlation_decision.kill_chain_progression_detected = true
-    - related_alerts_1h has more than 5 entries on the same host/user in the last hour
     - asset_context.criticality = high (or asset is described as a domain controller,
       database server, or crown-jewel)
-    - multiple distinct hosts appear in related_alerts_1h (lateral spread)
   NO if none of the above apply.
 
 Assign priority_band using first match, top to bottom:
@@ -281,21 +277,16 @@ without re-reading the full case. Example format:
 
 
 def build_user_prompt(evidence: EnrichedEvidence) -> str:
-    """Full evidence dump, minus one thing: `canonical_alert.cortex_results[]
-    .raw` — the full verbatim Cortex analyzer report per observable, which
-    can be large and is redundant with `.taxonomies`/`.verdict`/`.details`/
-    `.analyzer` (the already-structured extract this call actually reasons
-    over). Same exclusion the old (deleted) `prompts/context_agent.py`
-    already established, carried over unchanged — this is not a firewall,
-    just avoiding a redundant duplicate blob.
+    """Dumps the full evidence as JSON, except for
+    `canonical_alert.cortex_results[].raw` — the full verbatim Cortex
+    report per observable, which is large and redundant with the
+    already-structured `taxonomies`/`verdict`/`details`/`analyzer` fields
+    this call actually reasons over.
 
-    `canonical_alert.raw_alert` (added 2026-09-07, user-directed) is NOT
-    excluded — it is deliberately included verbatim. `alert_builder.py` was
-    trimmed the same day to extract only rule/host/user/network/observables
-    (plus `process.command_line`) structurally; everything else that used to
-    be a typed field (process detail, file, registry, target_process,
-    library, related_entities) is now read by this LLM call directly out of
-    `raw_alert` instead of through a typed intermediate only it consumed."""
+    `canonical_alert.raw_alert` is kept, deliberately: `alert_builder.py`
+    only extracts rule/host/observables structurally, so this is the only
+    place process, network, user, file, and registry detail reach the
+    model at all."""
     return evidence.model_dump_json(
         indent=2,
         exclude={"canonical_alert": {"cortex_results": {"__all__": {"raw"}}}},
@@ -303,15 +294,13 @@ def build_user_prompt(evidence: EnrichedEvidence) -> str:
 
 
 def build_triage_verdict_schema(evidence: EnrichedEvidence) -> dict:
-    """`merge_into_case_id` and `correlation_decision.action` are constrained
-    to this specific alert's real `open_cases` — see module docstring.
-    `recommended_action`'s enum stays the full 5-value set whenever open
-    cases exist (both the "new" and "merge" branches remain schema-legal —
-    see module docstring for why this call, unlike the old two-call design,
-    can't narrow it further ahead of generation); only excludes the
-    merge-only options when there are no open cases to merge into at all,
-    since `create_case`/`close_fp`/`needs_review` are always legal regardless
-    of branch. Deep-copies `_BASE_SCHEMA` so callers never mutate the shared
+    """Builds this alert's output schema from `_BASE_SCHEMA`, constraining
+    `merge_into_case_id` and `correlation_decision.action` to this alert's
+    real open cases (see module docstring). `recommended_action` drops its
+    merge-only options when there are no open cases to merge into; with
+    open cases present it keeps the full 5-value set, since the model
+    hasn't picked a branch for `action` yet when the schema is built.
+    Deep-copies the base schema so callers never mutate the shared
     template."""
     schema = copy.deepcopy(_BASE_SCHEMA)
     case_ids = [case.case_id for case in evidence.open_cases]
@@ -408,7 +397,7 @@ _BASE_SCHEMA: dict = {
             "type": "string",
             "enum": ["create_case", "close_fp", "merge_quiet", "merge_and_retier", "needs_review"],
         },
-        "evidence_citations": {"type": "array", "items": {"type": "string"}},
+        "evidence_analysis": {"type": "string"},
         "actionable_observables": {
             "type": "array",
             "items": {
@@ -460,7 +449,7 @@ _BASE_SCHEMA: dict = {
         "reasoning",
         "summary",
         "recommended_action",
-        "evidence_citations",
+        "evidence_analysis",
         "actionable_observables",
         "priority_band",
         "priority_reasoning",

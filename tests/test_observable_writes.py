@@ -1,22 +1,15 @@
-"""`tools/thehive.py::create_case_observable` — the one primitive that
-survives from the 2026-08-21 observable-write build.
+"""Tests for `tools/thehive.py::create_case_observable`.
 
-`add_extracted_observables` (the old composed "write all 6 ExtractedObservables
-buckets, blindly, no dedup" function this file used to test at length) was
-retired 2026-08-23 — see `nodes/case_action.py`'s module docstring for why:
-Stage 3's raw extraction was being written straight to TheHive without ever
-consulting Stage 4's judgment. Its replacement, `nodes/case_action.py::
-_write_actionable_observables`, is tested in `tests/test_case_action.py`
-instead (that's where the logic actually lives now — dedup-against-existing,
-confidence-based tags, ID capture).
+Dedup-against-existing, confidence-based tagging, and ID capture for
+observable writes live in `stages/case_action.py::_write_actionable_observables`
+and are tested in `tests/test_case_action.py`; this file covers only the
+underlying `create_case_observable` primitive.
 
-PROVENANCE for what remains here: `tests/fixtures/thehive_create_observable_real.json`
-is REAL — live-verified 2026-08-21 against `http://172.20.24.228:9000`
-(TheHive 5.7.5-1), disposable test case `~8609848`. `response_example` is a
-single real create-observable response (`POST /api/v1/case/{id}/observable`
-→ 201, a LIST containing the created object) — the exact shape the
-2026-08-23 fix (`create_case_observable` now returns the real assigned
-`_id` instead of discarding the response) depends on being correct.
+`tests/fixtures/thehive_create_observable_real.json` was captured against a
+disposable test case on a real TheHive instance (5.7.5-1). `response_example`
+is a real create-observable response (`POST /api/v1/case/{id}/observable` ->
+201, a list containing the created object) — `create_case_observable`
+returns the assigned `_id` from this shape.
 """
 
 import json

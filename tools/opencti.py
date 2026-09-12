@@ -1,50 +1,25 @@
-"""`opencti_observable_enrichment` — a deployment-added Stage-1 tool, NOT one
-of architecture v4 §6's original 7. See CLAUDE.md "Deployment-specific
-decisions: OpenCTI".
-
-Queries OpenCTI's GraphQL API directly for an observable's threat-graph
+"""Queries OpenCTI's GraphQL API directly for an observable's threat-graph
 context: is it a known indicator, and what is it related to (malware,
 intrusion-set, threat-actor, campaign, via `stixCoreRelationships`).
 
-DISTINCT FROM the OpenCTI Cortex analyzer (`OpenCTI_v6_SearchExactObservable_
-2_0`), whose taxonomy rows already arrive through
-`tools/thehive.py::get_full_alert_with_analysis` and are structured into
-`CortexResult` alongside VirusTotal's. That path answers "did the SOC's own
-Cortex pipeline flag this" from a pre-run analyzer job. This tool answers a
-different question — "what does OpenCTI's own graph say this observable
-relates to" — via a live GraphQL query, and both exist deliberately: neither
-replaces the other.
+This is separate from the OpenCTI Cortex analyzer, whose taxonomy rows
+already arrive through `tools/thehive.py::get_full_alert_with_analysis` and
+are structured into `CortexResult` alongside VirusTotal's — that path
+answers "did the SOC's Cortex pipeline flag this" from a pre-run analyzer
+job. This tool answers a different question, "what does OpenCTI's graph say
+this observable relates to", via a live query, and the two are complementary
+rather than redundant.
 
-VERIFIED AGAINST THE LIVE BACKEND 2026-08-13 — OpenCTI GraphQL 7.260318.0 at
-`http://172.20.24.222:8080/graphql`.
-
-A CREDENTIAL BUG WAS FOUND AND FIXED THE SAME DAY: the token stored in
-`.mcp.json` (`lgrn_octi_tkn_...`) was missing a leading `f` and returns
-`AUTH_REQUIRED` on every call. The corrected token (`flgrn_octi_tkn_...`) is
-what `OPENCTI_TOKEN` in `.env` and `config.py` now carry.
-
-THE EXACT-MATCH FILTER SHAPE, confirmed live:
-
-    query($filters: FilterGroup) {
-      stixCyberObservables(filters: $filters, first: N) { edges { node { ... } } }
-    }
-    filters = {"mode": "or", "filters": [{"key": "value", "values": [...]}], "filterGroups": []}
-
-Batching multiple values into one `values` list in a single call is confirmed
-working and returns only the genuine matches (verified with a 4-value batch —
-2 real hits, 2 non-matches — returning exactly the 2 hits). None of this
-deployment's own alert observables (the xordump URL, its sha256/imphash
-hashes, `github.com`) exist in this OpenCTI instance's data — expected, since
-they are a locally-generated test artifact, not a public IOC. The "found" path
-was verified against real threat-feed indicators already in this instance
-(`w8p3k.com`, `yezi.haoyun.bar`, `u85.ehlony.com` — domains from a recent OSINT
-feed import), the "not found" path against the alert's own sha256 hash.
+The GraphQL filter batches every observable value into one `stixCyberObservables`
+query with an `OR` filter group; values with no record in OpenCTI simply
+don't appear in the response and are reported as `found=False` rather than
+as an error.
 
 `stixCoreRelationships.to` uses inline fragments (`... on Malware { ... }`)
-because `to` is a STIX-core union type; an unmatched fragment (e.g. the
-relationship target is another Indicator, not a Malware/IntrusionSet/
-ThreatActor/Campaign) resolves to `{}` rather than erroring — handled by
-treating an empty `to` as "no attributable entity", not a Gap.
+since `to` is a STIX-core union type. When the relationship target doesn't
+match any of the fragments here (e.g. it's another Indicator, not a
+Malware/IntrusionSet/ThreatActor/Campaign), it resolves to `{}`, which is
+treated as "no attributable entity" rather than an error.
 """
 
 from __future__ import annotations
@@ -58,20 +33,37 @@ import httpx
 
 import config
 from schemas import Gap, Observables, OpenCTIEnrichment, OpenCTIRelation
-from tools.thehive import _entity_values  # noqa: F401 — deliberate cross-module
-# reuse: same "flatten an alert's IOCs into a match-value list" logic
-# tools/thehive.py::search_open_cases_by_entities already needs. Not
-# duplicated here; see CLAUDE.md "OpenCTI" entry.
 
 logger = logging.getLogger(__name__)
 
 SOURCE = "opencti"
 TOOL_NAME = "opencti_observable_enrichment"
 
-# Mirrors tools/thehive.py's MAX_ENTITY_VALUES — a very long value list makes
-# the query slower and risks a request-size rejection.
+# A very long value list makes the query slower and risks a request-size
+# rejection.
 MAX_ENTITY_VALUES = 50
 MAX_RELATIONS_PER_OBSERVABLE = 10
+
+
+def _flatten_observable_values(observables: Observables | None) -> list[str]:
+    """Flatten the alert's IOCs (external IPs, domains, URLs, every hash
+    algorithm) into one de-duplicated, order-preserving, capped list of
+    match values for the GraphQL filter below."""
+    values: list[str] = []
+    if observables is not None:
+        values.extend(observables.external_ips)
+        values.extend(observables.domains)
+        values.extend(observables.urls)
+        hashes = observables.hashes
+        values.extend(hashes.md5)
+        values.extend(hashes.sha1)
+        values.extend(hashes.sha256)
+        values.extend(hashes.sha512)
+        values.extend(hashes.imphash)
+
+    seen: set[str] = set()
+    unique = [v for v in values if v and not (v in seen or seen.add(v))]
+    return unique[:MAX_ENTITY_VALUES]
 
 _QUERY = """
 query Enrich($filters: FilterGroup) {
@@ -176,13 +168,13 @@ async def _query(filters: dict, timeout: float) -> Any:
 async def opencti_observable_enrichment(
     observables: Observables | None, timeout: float | None = None
 ) -> tuple[list[OpenCTIEnrichment], Gap | None]:
-    """Look up every IOC on the alert against OpenCTI's threat graph in one
-    batched query.
+    """Looks up every IOC on the alert against OpenCTI's threat graph in one
+    batched query. Never raises.
 
-    NEVER RAISES. Returns `(enrichments, Gap | None)`. Returns ONE entry per
-    queried value, `found=True` for values OpenCTI has a record of and
-    `found=False` for values it was checked against and does not — both are
-    real answers, not gaps. A Gap means the query itself could not be run.
+    Returns `(enrichments, Gap | None)`, one entry per queried value:
+    `found=True` when OpenCTI has a record of it, `found=False` when it was
+    checked and doesn't — both are real answers, not gaps. A Gap means the
+    query itself couldn't be run at all.
     """
     timeout = timeout if timeout is not None else config.STAGE_1_TOOL_TIMEOUT_OPENCTI
     started = time.monotonic()
@@ -195,7 +187,7 @@ async def opencti_observable_enrichment(
             duration_ms=int((time.monotonic() - started) * 1000),
         )
 
-    values = _entity_values(observables, None, None)[:MAX_ENTITY_VALUES]
+    values = _flatten_observable_values(observables)
     if not values:
         return [], gap("Alert carried no observables to check against OpenCTI")
 

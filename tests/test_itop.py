@@ -1,34 +1,24 @@
-"""`itop_asset_lookup` — architecture §6 tool 5.
+"""Tests for `itop_asset_lookup`.
 
-PROVENANCE: `tests/fixtures/itop_demo_real.json` holds ACTUAL captured
-responses from the live iTop at `http://172.20.24.220:8080` on 2026-08-14 —
-the stock community demo dataset (`Server1`, `Router1`), which is what this
-deployment's `config.ITOP_URL` currently points at. This SUPERSEDES the
-2026-08-08 capture against a different, now-gone instance (`PC::32`,
-win-kvkmd51ggkq) — see `tools/itop.py`'s module docstring for the full
-deployment-change note. Six real responses: hostname locate + finalclass
-refetch for both a `Server` and a `NetworkDevice`, a genuine not-found, a
-genuine asset_number-filter API error, and a genuine (empty) asset_number
-locate — the tool was called against the real backend before any of these
-tests were written or rewritten (implementation guide §2).
+`tests/fixtures/itop_demo_real.json` holds responses captured from the live
+iTop instance at 172.20.24.220:8080, using the stock community demo dataset
+(Server1, Router1). It covers a hostname locate plus finalclass refetch for
+both a Server and a NetworkDevice, a not-found response, an asset_number
+filter API error, and an empty asset_number locate.
 
-This deployment's iTop has NO network_zone, NO data_sensitivity, NO owner
-attribute on any class, and no *demo* object carries an IP or a populated
-`asset_number` — re-verified live 2026-08-14, same conclusion as before on a
-different instance. Tests assert those are None/empty because that is the
-verified truth today — see the module docstring of `tools/itop.py`.
+This iTop instance has no `network_zone`, `data_sensitivity`, or `owner`
+attribute on any class, and no demo object carries an IP or a populated
+`asset_number`. Tests assert those come back None/empty because that
+reflects the real instance, not a limitation of the test setup.
 
-**`Server::32` is not demo data.** It was created live on 2026-08-14
-(`core/create` via the iTop MCP) specifically so `itop_asset_lookup`'s
-asset_number-primary-match path has a real object to resolve against: `name`
-is the real Elastic Agent hostname from a captured production alert
-(`win-kvkmd51ggkq`) and `asset_number` is that alert's real
-`event_data.host.id` UUID (`c8fc26bf-dc76-4dba-adbb-bf31640d9c9f`) — not
-invented. `business_criticity`, `brand_id`, `osfamily_id`/`osversion_id`,
-`serialnumber`, `cpu`/`ram` ARE invented (no source of truth for them existed)
-but are valid FK references to real Brand/OSFamily/OSVersion/Location objects
-already in this CMDB — see `TestAssetNumberPathWhenPopulated` below, which
-uses this real object's real captured responses, not a synthetic stand-in.
+`Server::32` is not part of the demo dataset — it was added to this CMDB so
+the asset_number-primary-match path has a real object to resolve against.
+Its hostname and asset_number are a real Elastic Agent host UUID pulled from
+a captured production alert; the remaining fields (business_criticity,
+brand, OS family/version, serial number, CPU/RAM) were filled in manually
+but reference real Brand/OSFamily/OSVersion/Location objects already in this
+CMDB. `TestAssetNumberPathWhenPopulated` below uses the real captured
+responses for this object.
 """
 
 from __future__ import annotations
@@ -46,15 +36,15 @@ from tools.itop import ItopOqlValueError, _normalise_criticality, itop_asset_loo
 FIXTURE = Path(__file__).parent / "fixtures" / "itop_demo_real.json"
 HOSTNAME = "Server1"
 ROUTER_HOSTNAME = "Router1"
-# The real object created for this deployment (module docstring): a real
-# alert's hostname + real host.id UUID, so this DOES match live.
+# Server::32 (see module docstring): a real alert hostname and host UUID,
+# so this resolves against the live instance.
 POPULATED_HOSTNAME = "win-kvkmd51ggkq"
 POPULATED_HOST_UUID = "c8fc26bf-dc76-4dba-adbb-bf31640d9c9f"
 
 
 @pytest.fixture(scope="module")
 def real() -> dict:
-    """REAL — captured live from iTop at 172.20.24.220:8080 on 2026-08-14."""
+    """Captured live from iTop at 172.20.24.220:8080."""
     return json.loads(FIXTURE.read_text())
 
 
@@ -88,10 +78,8 @@ def run(coro):
 
 class TestAgainstRealCapturedResponses:
     def test_hostname_locate_resolves_against_the_live_backend(self, monkeypatch, real):
-        """One of two tests in this suite that skip mocking and hit the real,
-        live iTop. No host_id given, so this proves the hostname path alone
-        works end-to-end against the demo data, not just against a captured
-        fixture."""
+        """Runs against the real iTop instance rather than a mock, to confirm
+        the hostname-only lookup path works end-to-end."""
         context, gap = run(itop_asset_lookup(HOSTNAME, None))
         assert gap is None
         assert context.found is True
@@ -99,10 +87,8 @@ class TestAgainstRealCapturedResponses:
         assert context.hostname == HOSTNAME
 
     def test_asset_number_locate_resolves_against_the_live_backend(self, monkeypatch, real):
-        """The other live, unmocked test. `Server::32` (module docstring) is a
-        real object with a real, populated `asset_number` — this proves the
-        PRIMARY join path actually works end-to-end today, not just that the
-        code exists for when data eventually gets populated."""
+        """Runs against the real iTop instance to confirm the asset_number
+        lookup path (Server::32, see module docstring) resolves correctly."""
         context, gap = run(itop_asset_lookup(POPULATED_HOSTNAME, POPULATED_HOST_UUID))
         assert gap is None
         assert context.found is True
@@ -113,13 +99,9 @@ class TestAgainstRealCapturedResponses:
         assert context.os_version == "11"
 
     def test_full_field_set_after_final_class_refetch(self, monkeypatch, real):
-        """REGRESSION GUARD for a bug the first live run caught (2026-08-08,
-        against the old instance; still applies here).
-
-        `output_fields: "*"` returns only the attributes of the class queried.
-        Locating on FunctionalCI yields none of os_family/location/model_name;
-        the refetch on `finalclass` is what completes the record.
-        """
+        """iTop's `output_fields: "*"` only returns attributes of the class
+        queried. Locating on FunctionalCI misses os_family/location/
+        model_name; the refetch on `finalclass` fills in the rest."""
         patch_itop(monkeypatch, real)
         context, _ = run(itop_asset_lookup(HOSTNAME, None))
         assert context.itop_class == "Server"
@@ -145,9 +127,9 @@ class TestAgainstRealCapturedResponses:
         assert context.obsolete is False
 
     def test_fields_this_itop_does_not_have_are_none(self, monkeypatch, real):
-        """Verified absent from every class in this instance. When custom
-        fields are added later, THIS is the test that should change —
-        deliberately."""
+        """These attributes are absent from every class in this instance
+        today. If custom fields are added to iTop later, this test should be
+        updated to match."""
         patch_itop(monkeypatch, real)
         context, _ = run(itop_asset_lookup(HOSTNAME, None))
         assert context.network_zone is None
@@ -158,8 +140,8 @@ class TestAgainstRealCapturedResponses:
 
     def test_asset_type_prefers_networkdevicetype_name_over_model_name(self, monkeypatch, real):
         """Router1 has both `networkdevicetype_name` ("Router") and
-        `model_name` ("Procurve 2450") — the more specific, class-native field
-        must win."""
+        `model_name` ("Procurve 2450"); the more specific, class-native
+        field should win."""
         patch_itop(monkeypatch, real, router=True)
         context, _ = run(itop_asset_lookup(ROUTER_HOSTNAME, None))
         assert context.itop_class == "NetworkDevice"
@@ -167,12 +149,9 @@ class TestAgainstRealCapturedResponses:
 
 
 class TestAssetNumberPathWhenPopulated:
-    """REAL — `Server::32` (module docstring), captured 2026-08-14 via the
-    tool's own `_itop_get` transport, under
-    `locate_by_asset_number_populated` / `refetch_final_class_populated` in
-    the fixture. Formerly synthetic (no populated object existed); superseded
-    once `Server::32` was created, per this project's real-over-synthetic
-    fixture discipline."""
+    """Uses Server::32 (module docstring), captured under
+    `locate_by_asset_number_populated` / `refetch_final_class_populated`
+    in the fixture."""
 
     def test_asset_number_match_is_preferred_and_skips_hostname_query(self, monkeypatch, real):
         capture: dict = {}
@@ -191,12 +170,11 @@ class TestAssetNumberPathWhenPopulated:
         assert not any(c["class"] == "FunctionalCI" for c in capture["calls"])
 
     def test_refetch_failure_degrades_to_partial_object(self, monkeypatch, real):
-        """A refetch failure must not lose the locate-phase result — partial
-        data beats no data. The locate-phase response (real, from
-        `PhysicalDevice`) already carries `asset_number` and
-        `business_criticity` but not `osfamily_name` — see the "TWO THINGS..."
-        note in `tools/itop.py`'s module docstring — so `os_family` staying
-        `None` here is the expected real shape, not a simulated gap."""
+        """A refetch failure should not discard the locate-phase result.
+        The locate response from PhysicalDevice already carries
+        asset_number and business_criticity but not osfamily_name, so
+        os_family staying None here reflects the real response shape, not
+        a simulated failure."""
 
         async def flaky(cls, oql, timeout, fields="*"):
             if cls == "PhysicalDevice":
@@ -213,8 +191,8 @@ class TestAssetNumberPathWhenPopulated:
 
 class TestQueryConstruction:
     def test_uuid_queried_on_physicaldevice_not_functionalci(self, monkeypatch, real):
-        """`asset_number` is not a filterable attribute on FunctionalCI — the
-        real API rejects it. It exists only on PhysicalDevice and its
+        """`asset_number` is not a filterable attribute on FunctionalCI; the
+        API rejects it there. It only exists on PhysicalDevice and its
         subclasses."""
         capture: dict = {}
         patch_itop(monkeypatch, real, capture=capture)
@@ -224,20 +202,18 @@ class TestQueryConstruction:
         assert "asset_number" in first["oql"]
 
     def test_hostname_queried_on_broadest_class(self, monkeypatch, real):
-        """FunctionalCI deliberately — a VirtualMachine has no asset_number at
-        all (VMs are not PhysicalDevice), so the hostname path is what covers
-        them and must not be narrowed."""
+        """Queries FunctionalCI, the broadest class, since a VirtualMachine
+        has no asset_number at all (VMs aren't PhysicalDevice) and needs the
+        hostname path to be reachable."""
         capture: dict = {}
         patch_itop(monkeypatch, real, capture=capture)
         run(itop_asset_lookup(HOSTNAME, None))
         assert capture["calls"][0]["class"] == "FunctionalCI"
 
     def test_uuid_path_skips_the_hostname_query_entirely_when_no_match(self, monkeypatch, real):
-        """`real["locate_by_asset_number"]` is the genuine empty-result capture
-        (module docstring): most demo objects still have no asset_number, so
-        this documents that when the PhysicalDevice locate comes back empty,
-        the code still falls through to the hostname query — it does not skip
-        it."""
+        """When the PhysicalDevice locate comes back empty (the common case,
+        since most demo objects have no asset_number), the code still falls
+        through to the hostname query rather than giving up."""
         capture: dict = {}
         patch_itop(monkeypatch, real, capture=capture)
         run(itop_asset_lookup(HOSTNAME, POPULATED_HOST_UUID))
@@ -282,8 +258,8 @@ class TestOqlInjectionIsRejected:
 
 class TestFailuresProduceGapsNotExceptions:
     def test_asset_absent_is_a_valid_result(self, monkeypatch, real):
-        """Real captured not-found response. Distinguishable from a backend
-        failure — architecture §2 requirement 4."""
+        """A real not-found response, distinguishable from a backend
+        failure."""
         patch_itop(monkeypatch, {"locate_by_hostname": real["not_found"]})
         context, gap = run(itop_asset_lookup("does-not-exist-host"))
         assert context.found is False
@@ -291,10 +267,8 @@ class TestFailuresProduceGapsNotExceptions:
         assert "timeout" not in gap.reason.lower()
 
     def test_itop_application_error_is_surfaced(self, monkeypatch, real):
-        """iTop returns HTTP 200 with a non-zero `code` for API errors — it
-        does not use HTTP status codes. Real captured error response; the
-        exact wrapper text changed on this iTop build (module docstring) but
-        "Unknown filter code" is still a substring either way."""
+        """iTop returns HTTP 200 with a non-zero `code` for API errors
+        rather than using HTTP status codes."""
         patch_itop(monkeypatch, {"locate_by_hostname": real["error_unknown_filter"]})
         context, gap = run(itop_asset_lookup(HOSTNAME))
         assert context.found is False
@@ -339,9 +313,9 @@ class TestFailuresProduceGapsNotExceptions:
 
 class TestCriticalityGapSemantics:
     def test_found_without_criticality_still_produces_a_gap(self, monkeypatch):
-        """Architecture §17 calls unpopulated iTop the single biggest deployment
-        risk. A found-but-blank asset silently degrades impact scoring to a
-        constant, so it must NOT look like a fully successful lookup."""
+        """A found-but-blank asset should not look like a fully successful
+        lookup, since an unpopulated CMDB record would otherwise silently
+        degrade impact scoring to a constant."""
         blank = {
             "code": 0,
             "objects": {
@@ -367,6 +341,6 @@ class TestCriticalityGapSemantics:
         assert _normalise_criticality(raw) == expected
 
     def test_unknown_criticality_passes_through_rather_than_being_coerced(self, caplog):
-        """A new tier appearing in iTop is something to find out about, not to
-        silently flatten into a known value."""
+        """A criticality tier not in the known set should surface as-is
+        rather than being silently coerced into a known value."""
         assert _normalise_criticality("catastrophic") == "catastrophic"

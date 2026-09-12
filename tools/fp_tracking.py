@@ -1,54 +1,25 @@
-"""`get_fp_signal` and `record_triage_outcome` — architecture §6 tool 1, §18.
+"""Per-rule false-positive history, backed by local SQLite
+(`config.FP_TRACKING_DB_PATH`, created automatically on first run).
 
-Local SQLite (`config.FP_TRACKING_DB_PATH`), created on first run. This is
-the tightest-budget, highest-value Stage 1 tool: 100ms budget
-(`STAGE_1_TOOL_TIMEOUT_FP`), and per architecture's own citation (AACT,
-arXiv:2505.09843) the single strongest per-rule FP signal available — and
-unlike `search_closed_cases_by_rule` (empty for ~3 months after deployment)
-it's useful from the very first alert.
+A local file rather than a server-backed database keeps this dependency-free.
+`record_triage_outcome` is called only when an alert closes as a false
+positive, never on a true positive, so there's no valid denominator for a
+rate — `get_fp_signal` reports a raw count instead. Per the AACT literature
+(arXiv:2505.09843), this kind of per-rule FP count is one of the strongest
+signals available for automating alert closure, and unlike a case-history
+search against an external system it's useful from the very first alert.
 
-THREE DELIBERATE DESIGN DECISIONS, agreed with the maintainer, that diverge
-from architecture §6 tool 1's illustrative example:
+The 24h/30d windows are computed from a timestamped event-log table
+(`fp_events`) rather than a mutable counter, via two `COUNT(*) ... WHERE
+rule_uuid = ? AND triage_timestamp >= ?` queries. Cutoffs are computed in
+Python rather than SQLite's `datetime('now', ...)` so they're deterministic
+and can be injected in tests via the `now=` keyword.
 
-1. **SQLite, not MySQL.** Matches `config.FP_TRACKING_DB_PATH` (already
-   defined) and architecture's own file-layout comment. No server, no
-   credentials, no new dependency.
-
-2. **Two INDEPENDENT signals, not one joint rate.** `FPSignal` (see
-   `schemas/evidence.py`) reports the rule's FP history regardless of host,
-   and the host's FP history regardless of rule — two separate counts, not
-   one rate filtered `WHERE rule_uuid=? AND host=?`. `get_fp_signal` still
-   takes both `rule_uuid` and `host` (it needs both to report both), it just
-   never joins them together in a single query.
-
-3. **Counts, not a rate.** `record_triage_outcome` is called ONLY when an
-   alert closes as `false_positive` (never on a true-positive close) — same
-   as architecture's own INSERT example, which never shows a TP write either.
-   With only FP events ever logged, `fp_count / total_count` has no valid
-   denominator, so this tool reports the raw count as the signal, not a
-   0.0-1.0 fraction.
-
-**Time-windowing is kept** (24h short-term, 30d long-term, per architecture)
-by storing a timestamped event-log table (`fp_events`) rather than raw
-mutable counters, and computing two independent `COUNT(*) ... WHERE
-triage_timestamp >= ?` queries per window (one by `rule_uuid`, one by
-`host`). From the caller's side this behaves exactly like "a rule counter"
-and "a host counter" — internally it's an indexed COUNT over a small table,
-which gets the windowing for free. Window cutoffs are computed in Python
-(`datetime.now(timezone.utc) - timedelta(...)`), not SQLite's `datetime('now',
-...)`, so they're deterministic and injectable in tests via the `now=`
-keyword on both functions.
-
-Both functions NEVER RAISE. `sqlite3` is synchronous, so the actual work runs
-in `asyncio.to_thread(...)`, wrapped in `asyncio.wait_for(..., timeout)` —
-same shape as every other Stage 1 tool's async wrapper, just around a thread
-instead of an HTTP call. Zero history for a given rule/host is a real,
-fully-successful result (`FPSignal()` all-zero, `gap=None`) — implementation
-guide §2's own verification-input table says so explicitly. A `Gap` means an
-actual backend problem: a corrupt/locked DB file, an unwritable storage
-directory, or a timeout — architecture's stated failure mode ("SQLite file
-corrupted -> returns zeros, not catastrophic") still holds; a Gap accompanies
-those zeros so the caller can tell "no history" from "couldn't check."
+Neither public function raises. `sqlite3` is synchronous, so the actual work
+runs in `asyncio.to_thread`, wrapped in the same timeout pattern every other
+tool in this package uses around its own I/O. Zero history for a rule is a
+normal, successful result; a `Gap` is reserved for an actual backend problem
+— a corrupt or locked DB file, an unwritable storage directory, a timeout.
 """
 
 from __future__ import annotations
@@ -76,24 +47,22 @@ _SCHEMA = """
 CREATE TABLE IF NOT EXISTS fp_events (
     id INTEGER PRIMARY KEY AUTOINCREMENT,
     rule_uuid TEXT NOT NULL,
-    host TEXT NOT NULL,
     triage_timestamp TEXT NOT NULL,
     analyst_reason TEXT
 );
 CREATE INDEX IF NOT EXISTS idx_fp_events_rule ON fp_events(rule_uuid, triage_timestamp);
-CREATE INDEX IF NOT EXISTS idx_fp_events_host ON fp_events(host, triage_timestamp);
 """
 
 
 def _connect(db_path: str) -> sqlite3.Connection:
     """Open a connection, creating the parent directory, file, and schema on
-    first run (architecture §18: "created on first run"). Idempotent — safe
-    to call on every invocation, matches the no-persistent-connection pattern
-    every other Stage 1 tool already uses (a fresh httpx client per call)."""
+    first run. Idempotent — safe to call on every invocation, matches the
+    no-persistent-connection pattern every other tool in this repo already
+    uses (a fresh httpx client per call)."""
     path = Path(db_path)
     path.parent.mkdir(parents=True, exist_ok=True)
     conn = sqlite3.connect(db_path)
-    conn.execute("PRAGMA journal_mode=WAL")  # concurrent Stage-1 reads while Stage-6 writes
+    conn.execute("PRAGMA journal_mode=WAL")  # concurrent reads while a triage outcome is written
     conn.executescript(_SCHEMA)
     conn.commit()
     return conn
@@ -107,42 +76,29 @@ def _count_rule_since(conn: sqlite3.Connection, rule_uuid: str, cutoff_iso: str)
     return row[0] if row else 0
 
 
-def _count_host_since(conn: sqlite3.Connection, host: str, cutoff_iso: str) -> int:
-    row = conn.execute(
-        "SELECT COUNT(*) FROM fp_events WHERE host = ? AND triage_timestamp >= ?",
-        (host, cutoff_iso),
-    ).fetchone()
-    return row[0] if row else 0
-
-
-def _get_fp_signal_sync(
-    db_path: str, rule_uuid: str | None, host: str | None, now: datetime
-) -> FPSignal:
+def _get_fp_signal_sync(db_path: str, rule_uuid: str | None, now: datetime) -> FPSignal:
     conn = _connect(db_path)
     try:
-        short_cutoff = (now - SHORT_TERM_WINDOW).isoformat()
-        long_cutoff = (now - LONG_TERM_WINDOW).isoformat()
         signal = FPSignal()
         if rule_uuid:
+            short_cutoff = (now - SHORT_TERM_WINDOW).isoformat()
+            long_cutoff = (now - LONG_TERM_WINDOW).isoformat()
             signal.rule_fp_count_24h = _count_rule_since(conn, rule_uuid, short_cutoff)
             signal.rule_fp_count_30d = _count_rule_since(conn, rule_uuid, long_cutoff)
-        if host:
-            signal.host_fp_count_24h = _count_host_since(conn, host, short_cutoff)
-            signal.host_fp_count_30d = _count_host_since(conn, host, long_cutoff)
         return signal
     finally:
         conn.close()
 
 
 def _record_sync(
-    db_path: str, rule_uuid: str, host: str, analyst_reason: str | None, now: datetime
+    db_path: str, rule_uuid: str, analyst_reason: str | None, now: datetime
 ) -> None:
     conn = _connect(db_path)
     try:
         conn.execute(
-            "INSERT INTO fp_events (rule_uuid, host, triage_timestamp, analyst_reason) "
-            "VALUES (?, ?, ?, ?)",
-            (rule_uuid, host, now.isoformat(), analyst_reason),
+            "INSERT INTO fp_events (rule_uuid, triage_timestamp, analyst_reason) "
+            "VALUES (?, ?, ?)",
+            (rule_uuid, now.isoformat(), analyst_reason),
         )
         conn.commit()
     finally:
@@ -151,26 +107,19 @@ def _record_sync(
 
 async def get_fp_signal(
     rule_uuid: str | None,
-    host: str | None,
     timeout: float | None = None,
     *,
     now: datetime | None = None,
 ) -> tuple[FPSignal, Gap | None]:
-    """How often has this rule fired FP (any host), and this host had FP
-    closures (any rule), in the last 24h / 30d?
+    """How often has this rule fired as a false positive in the last 24h/30d?
 
-    NEVER RAISES. Returns `(FPSignal, Gap | None)`:
+    Never raises. Returns `(FPSignal, Gap | None)`: zero counts with no Gap
+    means the rule genuinely has no history yet, which is a successful
+    result, not a failure. A Gap means the lookup itself couldn't run — no
+    rule uuid was given, or the database couldn't be reached — and the
+    counts stay at zero either way.
 
-    - history found or genuinely empty -> `(FPSignal(...), None)` — zero
-      counts with no Gap is a real, fully successful "no history yet" result
-      (implementation guide §2), not a failure.
-    - nothing to look up               -> `(FPSignal(), Gap)`, DB never touched
-    - backend problem                  -> `(FPSignal(), Gap)` with the reason;
-                                           counts stay at zero either way, per
-                                           architecture's stated failure mode
-
-    `now` is keyword-only and exists for deterministic testing — real callers
-    never pass it.
+    `now` is keyword-only, for deterministic tests; real callers never pass it.
     """
     timeout = timeout if timeout is not None else config.STAGE_1_TOOL_TIMEOUT_FP
     started = time.monotonic()
@@ -178,11 +127,11 @@ async def get_fp_signal(
     def elapsed_ms() -> int:
         return int((time.monotonic() - started) * 1000)
 
-    if not rule_uuid and not host:
+    if not rule_uuid:
         return FPSignal(), Gap(
             source=SOURCE,
             tool=TOOL_NAME_GET,
-            reason="No rule uuid or host on the alert — nothing to look up",
+            reason="No rule uuid on the alert — nothing to look up",
             duration_ms=elapsed_ms(),
         )
 
@@ -191,7 +140,7 @@ async def get_fp_signal(
     try:
         signal = await asyncio.wait_for(
             asyncio.to_thread(
-                _get_fp_signal_sync, config.FP_TRACKING_DB_PATH, rule_uuid, host, resolved_now
+                _get_fp_signal_sync, config.FP_TRACKING_DB_PATH, rule_uuid, resolved_now
             ),
             timeout=timeout,
         )
@@ -233,7 +182,6 @@ async def get_fp_signal(
 
 async def record_triage_outcome(
     rule_uuid: str,
-    host: str,
     analyst_reason: str | None = None,
     timeout: float | None = None,
     *,
@@ -241,19 +189,14 @@ async def record_triage_outcome(
 ) -> tuple[bool, Gap | None]:
     """Record a false-positive triage closure.
 
-    Call this ONLY when an alert closes as `false_positive` (architecture's
-    "FP feedback loop", Stage 6 / `/feedback` endpoint — not wired yet, build
-    order step 8). Never call it for a true-positive close — see module
-    docstring, design decision 3. The caller decides the verdict; this
-    function only writes.
+    Call this only when an alert closes as `false_positive` — never on a
+    true positive, or the count above loses its meaning as a denominator-free
+    signal. The caller decides the verdict; this function only writes it.
 
-    NEVER RAISES. Returns `(True, None)` on success, `(False, Gap)` on any
-    failure (missing keys, backend problem, timeout).
-
-    Reuses `STAGE_1_TOOL_TIMEOUT_FP` as the default budget — this write
-    happens from Stage 6, not Stage 1, but no dedicated timeout constant
-    exists yet and 100ms is still generous for a local insert; a Stage-6
-    constant can be added in config.py when `nodes/audit.py` is built.
+    Never raises. Returns `(True, None)` on success, `(False, Gap)` on any
+    failure. Reuses `STAGE_1_TOOL_TIMEOUT_FP` as the default budget, which is
+    generous for a local insert even though this write happens later in the
+    pipeline than the initial evidence-gathering reads.
     """
     timeout = timeout if timeout is not None else config.STAGE_1_TOOL_TIMEOUT_FP
     started = time.monotonic()
@@ -261,11 +204,11 @@ async def record_triage_outcome(
     def elapsed_ms() -> int:
         return int((time.monotonic() - started) * 1000)
 
-    if not rule_uuid or not host:
+    if not rule_uuid:
         return False, Gap(
             source=SOURCE,
             tool=TOOL_NAME_RECORD,
-            reason="rule_uuid and host are both required to record a triage outcome",
+            reason="rule_uuid is required to record a triage outcome",
             duration_ms=elapsed_ms(),
         )
 
@@ -277,7 +220,6 @@ async def record_triage_outcome(
                 _record_sync,
                 config.FP_TRACKING_DB_PATH,
                 rule_uuid,
-                host,
                 analyst_reason,
                 resolved_now,
             ),

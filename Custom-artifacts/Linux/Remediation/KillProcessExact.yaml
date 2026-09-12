@@ -1,0 +1,44 @@
+name: Custom.Linux.Remediation.KillProcessExact
+author: SOC-3s
+description: |
+  Kill a process on Linux using exact match on executable path (required)
+  and optionally an exact PID as secondary narrowing filter.
+  Uses = equality not =~ regex to avoid escaping issues with Linux paths.
+  ReallyDoIt defaults to FALSE (dry-run).
+
+type: CLIENT
+
+parameters:
+  - name: TargetExe
+    description: Full exact executable path (case-sensitive on Linux)
+    type: string
+
+  - name: TargetPid
+    description: Exact PID to require as additional filter. 0 = skip PID check.
+    type: int
+    default: 0
+
+  - name: ReallyDoIt
+    description: Set TRUE to actually kill. FALSE = dry-run only.
+    type: bool
+    default: FALSE
+
+sources:
+  - precondition:
+      SELECT OS FROM info() WHERE OS = 'linux'
+
+    query: |
+      LET me = SELECT Pid FROM pslist(pid=getpid())
+
+      LET targets = SELECT Name AS ProcessName, Exe, CommandLine, Pid
+        FROM pslist()
+        WHERE Exe = TargetExe
+          AND (TargetPid = 0 OR Pid = TargetPid)
+          AND NOT Pid IN me.Pid
+
+      SELECT ProcessName, Exe, CommandLine, Pid,
+        if(condition = ReallyDoIt,
+           then = pskill(pid=Pid),
+           else = "DRY_RUN - not killed, ReallyDoIt was FALSE"
+        ) AS Result
+      FROM targets

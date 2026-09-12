@@ -1,47 +1,35 @@
-"""`detection_rule_lookup` — architecture §6 tool 2, §13.
+"""`detection_rule_lookup` — fetches the detection rule that fired from the
+Security Onion `so-detection` Elasticsearch index, and parses its original
+rule content for the MITRE ATT&CK metadata the triage LLM needs.
 
-Fetches the detection rule that fired, from the Security Onion `so-detection`
-Elasticsearch index, and parses its original Sigma YAML for the metadata that
-Stage 3 and Stage 5 need.
+Four things about the real backend that aren't obvious from the index shape
+alone:
 
-VERIFIED AGAINST THE LIVE BACKEND 2026-08-08 for rule
-`5e3cc4d8-3e68-43db-8656-eaaeefdec9cc` ("Suspicious Invoke-WebRequest
-Execution"). The document shape below is the real one, not the architecture
-doc's illustrative example. Captured response saved at
-`tests/fixtures/so_detection_5e3cc4d8.json`.
-
-Four things the real backend does that the architecture doc's example does not:
-
-1. The index must be `so-detection` EXACTLY. The `so-detection*` wildcard also
-   matches `so-detectionhistory` — 345,474 revision documents alongside 74,951
-   current rules — so a wildcard query can return a superseded rule version.
-2. `so_detection.language` is the rule language ("sigma"); `so_detection.engine`
-   is the *execution* engine ("elastalert"). `source_engine` comes from
-   `language`. Reading `engine` would send every rule down the wrong parse
-   branch.
+1. The index must be `so-detection` EXACTLY. The `so-detection*` wildcard
+   also matches `so-detectionhistory` — hundreds of thousands of revision
+   documents alongside the current rule set — so a wildcard query can return
+   a superseded rule version.
+2. `so_detection.language` is the rule language ("sigma", "suricata",
+   "yara"); `so_detection.engine` is the *execution* engine (e.g.
+   "elastalert"). `source_engine` comes from `language` — reading `engine`
+   would send every rule down the wrong parse branch.
 3. Doc-level `so_detection.tags` is `null`. MITRE lives only inside
-   `so_detection.content`, the original pre-compilation Sigma YAML. The
-   compiled ElastAlert rule strips it. That YAML must be parsed.
-4. `falsepositives` is commonly the literal `["Unknown"]` — Sigma's placeholder
-   for "none documented", not an actual false-positive condition.
+   `so_detection.content`, the original pre-compilation rule text (Sigma
+   YAML or Suricata's inline rule syntax) — the compiled/indexed rule strips
+   it, so that content field must be parsed directly.
+4. `falsepositives` is commonly the literal `["Unknown"]` — Sigma's
+   placeholder for "none documented", not an actual false-positive
+   condition.
 
-Suricata rules arrive with `language="suricata"` and a `content` field that is
-raw Suricata rule syntax, not YAML — `_parse_suricata_content` handles that
-branch. VERIFIED AGAINST THE LIVE BACKEND 2026-08-18 against 5 real rules
-(SIDs 2001482, 2001485, 2001734, 2002016, 2016781; one saved at
-`tests/fixtures/so_detection_suricata_mitre_real.json`) and against the rule
-tied to the real captured alert (SID 2100498, `tests/fixtures/
-so_detection_2100498.json`). 32,458 of 67,434 real Suricata rules (48%) carry
-a parseable `metadata:mitre_tactic_id ..., mitre_technique_id ..., ...;` clause
-— confirmed by live aggregation, not estimated.
+Suricata rules arrive with `language="suricata"` and a `content` field that
+is raw Suricata rule syntax, not YAML — `_parse_suricata_content` handles
+that branch, pulling MITRE metadata out of the rule's inline `metadata:`
+clause when one is present (roughly half of real Suricata rules carry one;
+the rest legitimately have no ATT&CK mapping at all).
 
-YARA rules (`language="yara"`) are still unparsed — checked live 2026-08-18:
-0 of 4,321 real YARA rule bodies in this deployment contain any MITRE
-reference at all (their `meta:` block carries `author`/`description`/
-`reference`/`date`/`score`/hash fields instead), and no `strelka.*` alert
-index exists here, so there is neither data to extract nor a live alert path
-to verify a parser against. `content_parse_error` is left set for this branch
-deliberately — see CLAUDE.md.
+YARA rules (`language="yara"`) are not parsed for MITRE metadata: their
+`meta:` block carries `author`/`description`/`reference`/`date`/`score`/hash
+fields, never an ATT&CK reference, so there is nothing to extract.
 """
 
 from __future__ import annotations
@@ -83,10 +71,10 @@ _SURICATA_METADATA_RE = re.compile(r"\bmetadata:\s*([^;]*)")
 
 # Suricata's own severity vocabulary (`signature_severity`), distinct from
 # Sigma's low/medium/high/critical. Mapped onto the same lowercase scale
-# RuleContext.level otherwise carries so Stage 3 doesn't need to special-case
-# the source engine. Confirmed live 2026-08-18: these 4 values cover 67,064 of
-# 67,434 real Suricata rules with a signature_severity key (the remainder use
-# some other/malformed value and fall through to the lowercased raw string).
+# RuleContext.level otherwise carries so downstream code doesn't need to
+# special-case the source engine. These four values cover the large majority
+# of real Suricata rules with a signature_severity key; a rule with some
+# other/malformed value falls through to the lowercased raw string.
 _SURICATA_SEVERITY_MAP = {
     "informational": "informational",
     "minor": "low",
@@ -110,7 +98,7 @@ def _normalise_sigma_tags(tags: list) -> dict[str, list[str]]:
         car.2013-05-002          -> other
 
     Technique ids are upper-cased to the canonical ATT&CK form because that is
-    what Stage 2's Qdrant `mitre_techniques` payloads and Stage 3's output
+    what the Qdrant `mitre_techniques` payloads and the triage LLM's output
     schema both use. Tactic names are left in Sigma's hyphenated lowercase form,
     which matches ATT&CK's own shortname (`command-and-control`).
 
@@ -166,11 +154,11 @@ def _parse_sigma_content(content: str, context: RuleContext) -> None:
     `yaml.safe_load` only — the content is rule text from a community ruleset
     and must never be able to construct Python objects.
 
-    A parse failure is recorded on `content_parse_error` and left non-fatal: the
-    doc-level fields (title, severity, description, product, category) have
-    already populated, so the rule is still usable, just without MITRE grounding
-    — which is exactly the degradation architecture §6 describes for this tool
-    ("MITRE falls back to Qdrant retrieval in Stage 2").
+    A parse failure is recorded on `content_parse_error` and left non-fatal:
+    the doc-level fields (title, severity, description, product, category)
+    have already populated, so the rule is still usable, just without MITRE
+    grounding from this source — RAG retrieval against the MITRE technique
+    corpus covers that gap downstream.
     """
     try:
         parsed = yaml.safe_load(content)
@@ -219,9 +207,7 @@ def _parse_sigma_content(content: str, context: RuleContext) -> None:
 
 def _parse_suricata_content(content: str, context: RuleContext) -> None:
     """Parse a Suricata rule's inline `metadata:` clause in-place onto
-    `context`. Live-verified 2026-08-18 against 5 real rules (SIDs 2001482,
-    2001485, 2001734, 2002016, 2016781) plus the rule tied to the real
-    captured alert (SID 2100498) — see this module's docstring.
+    `context`.
 
     Real clause shape, verbatim from a live rule:
     `metadata:attack_target Client_Endpoint, created_at 2010_07_30, deployment
@@ -229,10 +215,10 @@ def _parse_suricata_content(content: str, context: RuleContext) -> None:
     TA0009, mitre_tactic_name Collection, mitre_technique_id T1005,
     mitre_technique_name Data_from_local_system;`
 
-    `mitre_technique_id` feeds `mitre_attack` (same list Sigma populates, so
-    Stage 2/3 code never needs to know which engine a technique came from).
-    `mitre_tactic_name` feeds `mitre_tactics`, normalised to ATT&CK's own
-    hyphenated-lowercase shortname convention (`Defense_Evasion` ->
+    `mitre_technique_id` feeds `mitre_attack` (the same list Sigma populates,
+    so downstream code never needs to know which engine a technique came
+    from). `mitre_tactic_name` feeds `mitre_tactics`, normalised to ATT&CK's
+    own hyphenated-lowercase shortname convention (`Defense_Evasion` ->
     `defense-evasion`) for the same reason. Everything else Suricata's
     metadata carries (`mitre_tactic_id`, `mitre_technique_name`,
     `attack_target`, `deployment`, `created_at`, `updated_at`, and any future
@@ -240,12 +226,12 @@ def _parse_suricata_content(content: str, context: RuleContext) -> None:
     `key:value` rather than being discarded — the same "no typed home yet"
     convention `_normalise_sigma_tags` uses for unrecognised Sigma tags.
 
-    No absence of a `metadata:` clause is not an error: 34,976 of 67,434 real
-    Suricata rules (52%) have no MITRE mapping at all, and that's a legitimate,
-    common shape, not a parse failure — `content_parse_error` is set only when
-    the clause itself can't be found, so Stage 2/3 can distinguish "this rule
-    genuinely carries no ATT&CK metadata" from "something about this content
-    didn't parse".
+    The absence of a `metadata:` clause is not an error: a large share of
+    real Suricata rules have no MITRE mapping at all, and that's a
+    legitimate, common shape, not a parse failure — `content_parse_error` is
+    set only when the clause itself can't be found, so downstream code can
+    distinguish "this rule genuinely carries no ATT&CK metadata" from
+    "something about this content didn't parse".
     """
     match = _SURICATA_METADATA_RE.search(content)
     if not match:
@@ -287,8 +273,8 @@ def _parse_suricata_content(content: str, context: RuleContext) -> None:
 
 
 def _build_rule_context(rule_uuid: str, document: dict) -> RuleContext:
-    """Map a raw `so_detection` document onto RuleContext. Field names are the
-    real ones captured live — see this module's docstring."""
+    """Map a raw `so_detection` document onto RuleContext — see this module's
+    docstring for the real field names and their quirks."""
     context = RuleContext(
         found=True,
         rule_uuid=document.get("publicId") or rule_uuid,
@@ -323,10 +309,9 @@ def _build_rule_context(rule_uuid: str, document: dict) -> RuleContext:
             _parse_sigma_content(content, context)
         elif language == "suricata":
             _parse_suricata_content(content, context)
-        # yara: no parser yet — deliberately left as content_parse_error is
-        # NOT set here (the content itself is real and present); see this
-        # module's docstring for why a YARA-specific parser has nothing to
-        # extract in this deployment.
+        # yara: no MITRE parser — content_parse_error is deliberately NOT set
+        # here (the content itself is real and present, there's just no
+        # ATT&CK metadata in a YARA rule's meta: block to extract).
     else:
         context.content_parse_error = "so_detection.content was empty or absent"
 
@@ -336,9 +321,9 @@ def _build_rule_context(rule_uuid: str, document: dict) -> RuleContext:
 async def detection_rule_lookup(
     rule_uuid: str, timeout: float | None = None
 ) -> tuple[RuleContext, Gap | None]:
-    """Look up a detection rule by its uuid.
+    """Look up a detection rule by its uuid. Never raises.
 
-    NEVER RAISES. Returns `(RuleContext, Gap | None)`:
+    Returns `(RuleContext, Gap | None)`:
 
     - found        -> `(populated RuleContext, None)`
     - not in index -> `(RuleContext(found=False), Gap)` — a real, valid result,
@@ -348,9 +333,9 @@ async def detection_rule_lookup(
                       reason distinguishes them.
     - backend fail -> `(RuleContext(found=False), Gap)` with the transport error
 
-    The caller in `nodes/gather.py` also wraps this in its own timeout — this
-    tool's internal timeout bounds the HTTP call, gather's bounds total wall
-    time including event-loop scheduling. Both are intentional.
+    The caller also wraps this in its own timeout — this tool's internal
+    timeout bounds the HTTP call, the caller's bounds total wall time
+    including event-loop scheduling. Both are intentional.
     """
     timeout = timeout if timeout is not None else config.STAGE_1_TOOL_TIMEOUT_ES
     started = time.monotonic()

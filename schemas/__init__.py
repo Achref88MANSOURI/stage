@@ -1,19 +1,16 @@
 """Typed stage-boundary contracts.
 
-Architecture §12: every stage boundary is a strict Pydantic model. A field
-renamed in one stage and misread in the next must fail loudly at validation
-time, never silently produce an empty value downstream.
+Every stage boundary is a strict Pydantic model, so a field renamed in one
+stage and misread in the next fails loudly at validation time, never
+silently produces an empty value downstream.
 
-`alert.py` (Stage 0), `evidence.py` (Stages 1-2), and `result.py` (the
-top-level triage result) exist. `result.py` no longer represents a distinct
-Stage 5 — v5 (`newdesign.md`) deleted the numeric scoring stage; priority
-now comes from `verdict.py`. `assessment.py` (2026-09-06, v6 redesign) no
-longer represents a distinct Stage 3 either — `ContextualAssessment` is
-deleted, and the module now holds shared building-block models
-(`MitreMapping`/`CorrelationDecision`/`EvidenceSource`/`EvidenceSituation`)
-composed directly by `verdict.py::TriageVerdict`, the single-call output
-contract that replaced the old Stage 3 + Stage 4 split. See
-`schemas/verdict.py`'s module docstring for the full v6 rationale.
+`alert.py` holds the canonical alert shape. `evidence.py` holds the gathered
+and RAG-enriched evidence passed into the LLM call. `assessment.py` holds
+shared building-block models (`MitreMapping`/`CorrelationDecision`/
+`EvidenceSource`/`EvidenceSituation`) composed by `verdict.py::TriageVerdict`,
+the LLM call's output contract. `result.py` holds the top-level triage
+result assembled from `TriageVerdict` plus `EnrichedEvidence`; priority comes
+directly from the verdict, with no separate numeric-scoring stage.
 """
 
 from schemas.alert import (
@@ -23,12 +20,9 @@ from schemas.alert import (
     HashBundle,
     Host,
     InvestigationProfile,
-    Network,
     OSInfo,
     Observables,
-    Process,
     Rule,
-    User,
 )
 from schemas.assessment import (
     CorrelationDecision,
@@ -37,7 +31,6 @@ from schemas.assessment import (
     MitreMapping,
 )
 from schemas.evidence import (
-    AlertSummary,
     AssetContext,
     EnrichedEvidence,
     FPSignal,
@@ -46,7 +39,6 @@ from schemas.evidence import (
     MitreCandidate,
     OpenCTIEnrichment,
     OpenCTIRelation,
-    PlaybookMatch,
     RawEvidence,
     RuleContext,
     ShallowCase,
@@ -59,7 +51,6 @@ from schemas.verdict import ActionableObservable, TriageVerdict
 
 __all__ = [
     "ActionableObservable",
-    "AlertSummary",
     "AlertWebhookPayload",
     "AssetContext",
     "CanonicalAlert",
@@ -78,13 +69,10 @@ __all__ = [
     "LogSource",
     "MitreCandidate",
     "MitreMapping",
-    "Network",
     "OSInfo",
     "Observables",
     "OpenCTIEnrichment",
     "OpenCTIRelation",
-    "PlaybookMatch",
-    "Process",
     "RawEvidence",
     "Rule",
     "RuleContext",
@@ -92,7 +80,6 @@ __all__ = [
     "TriageResponse",
     "TriageResult",
     "TriageVerdict",
-    "User",
     "has_known_falsepositives",
     "has_reliable_status",
 ]

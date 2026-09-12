@@ -1,0 +1,57 @@
+{
+  "name": "Velociraptor_KillProcess",
+  "version": "0.2",
+  "author": "SOC-3s (adapted from Wes Lambert, @therealwlambert)",
+  "url": "https://github.com/Achref88MANSOURI/SOC-3s",
+  "license": "AGPL-V3",
+  "description": "Kill a process on a Velociraptor-enrolled endpoint using exact executable-path matching. Triggered on a process-path observable; resolves the target endpoint via the parent case hostname/endpoint-ip observables.",
+  "dataTypeList": ["process-path"],
+  "command": "Velociraptor/vr_killprocess.py",
+  "baseConfig": "Velociraptor_KillProcess",
+  "configurationItems": [
+    {
+      "name": "velociraptor_client_config",
+      "description": "Path to Velociraptor API client config file",
+      "type": "string",
+      "multi": false,
+      "required": false
+    },
+    {
+      "name": "velociraptor_client_config_content_base64",
+      "description": "Base64-encoded Velociraptor API client config file (YAML). Recommended for containerized deployments.",
+      "type": "string",
+      "multi": false,
+      "required": false
+    },
+    {
+      "name": "thehive_url",
+      "description": "TheHive base URL (e.g. http://172.20.24.228:9000)",
+      "type": "string",
+      "multi": false,
+      "required": true
+    },
+    {
+      "name": "thehive_apikey",
+      "description": "TheHive API key with read access to case observables",
+      "type": "string",
+      "multi": false,
+      "required": true
+    },
+    {
+      "name": "really_do_it",
+      "description": "If false (default), dry-run only — reports what would be killed without killing. Set true only after end-to-end verification.",
+      "type": "boolean",
+      "multi": false,
+      "required": false,
+      "defaultValue": false
+    },
+    {
+      "name": "query_max_duration",
+      "description": "Max query duration in seconds",
+      "type": "number",
+      "multi": false,
+      "required": false,
+      "defaultValue": "600"
+    }
+  ]
+}

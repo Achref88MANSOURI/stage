@@ -1,51 +1,21 @@
-"""`tools/thehive.py`'s write functions and `nodes/case_action.py` — the
-case-creation/merge stage, a deliberate 2026-08-21 deviation from
-architecture §1/§3's read-only design (see CLAUDE.md's "Case action" entry
-and both modules' docstrings for the full record).
+"""Tests for `tools/thehive.py`'s write functions and
+`stages/case_action.py`, the case creation/merge stage. This service
+creates or merges TheHive cases itself rather than leaving that to a
+downstream workflow (see both modules' docstrings for the design
+rationale).
 
-PROVENANCE, all real, all 2026-08-21, against the live TheHive instance:
+The write endpoints (`update_case`, `add_case_comment`,
+`create_case_from_alert`, `merge_alert_into_case`) were each verified
+against a live TheHive instance during development, including one full
+end-to-end run of the case_action node captured in
+`tests/fixtures/case_action_live_run_real.json`. Everything else here
+mocks `tools.thehive._write` or the write functions directly and checks
+orchestration logic only.
 
-- `update_case` and `add_case_comment` were each called for real against the
-  disposable test case `~8609848` (a manually-created "test" case with zero
-  real observables — already the safe target this repo's own `thehive_real
-  .json` fixture documents) and confirmed to work (`204`/`201`).
-- `create_case_from_alert`'s underlying `POST /api/v1/alert/{id}/case`
-  endpoint was discovered and confirmed live (real case `~4464672` created
-  from real alert `~4636880`, 201) — but the composed FUNCTION itself
-  (promote, then PATCH content) could not be run as one unbroken real call:
-  this deployment had exactly 3 real alerts total, and both spare ones were
-  consumed by endpoint discovery before the function was written. The two
-  halves are each independently real-verified (create via raw probe, PATCH
-  via `update_case`'s real success above); the composition is not. Documented
-  here rather than silently claimed as fully tested.
-- `merge_alert_into_case` was verified live TWICE: once directly (a real
-  already-imported alert merged toward the test case, real HTTP 400 "Alert
-  is already imported" — confirms the endpoint path, since a wrong path
-  would 404, not 400), and once again through the actual `nodes.case_action
-  .case_action` node end-to-end (`tests/fixtures/case_action_live_run_real
-  .json`) using real `gather_evidence`+`rag_enrichment` output, a real
-  `thehive_alert_id`, and `correlation_decision.action` forced to `"merge"`
-  against the same test case — confirms the whole node's content-building,
-  dispatch, and error-propagation path for real, even though the underlying
-  TheHive call fails business-logic-wise (the expected, understood outcome).
-- The `action == "new"` dispatch branch was also run live end-to-end (not
-  captured to a fixture — a clean failure, nothing to regress-guard beyond
-  what the mocked tests below already cover) against a syntactically valid
-  but nonexistent alert id — real HTTP 404, `NotFoundError`, no crash.
-
-Everything else here mocks `tools.thehive._write` or the four write
-functions directly and checks orchestration logic only, per this repo's
-standard split between real-backend verification and mocked regression
-coverage.
-
-**v6 redesign (2026-09-06)**: `case_action(verdict, evidence)` takes ONE
-object now, not a `verdict`+`context` pair — `correlation_decision`/
-`evidence_situation` live directly on `TriageVerdict` (the old
-`ContextualAssessment`/`make_context()` helper is gone; `make_verdict()`
-below now takes `action`/`merge_into_case_id`/`evidence_situation` directly
-and builds the whole thing). `ExtractedObservable`/`ExtractedObservables`
-(the old ~raw extraction~ helpers) are gone too — nothing in the new design
-produces that shape any more, see `schemas/verdict.py`'s docstring.
+`case_action(verdict, evidence)` takes one `TriageVerdict` object;
+`correlation_decision`/`evidence_situation` live directly on it, and
+`make_verdict()` below builds one from those plus `action`/
+`merge_into_case_id`.
 """
 
 from __future__ import annotations
@@ -58,7 +28,7 @@ from pathlib import Path
 import httpx
 import pytest
 
-from nodes import case_action as case_action_mod
+from stages import case_action as case_action_mod
 from schemas import (
     ActionableObservable,
     AssetContext,
@@ -209,7 +179,8 @@ class TestMergeAlertIntoCase:
         assert called["n"] == 0
 
     def test_already_imported_failure_returns_gap(self, monkeypatch):
-        """Reproduces the exact real failure this was live-verified against."""
+        """Reproduces the real 400 response TheHive returns when merging an
+        alert that's already imported into a case."""
         response = httpx.Response(
             400,
             json={"type": "BadRequest", "message": "Alert is already imported"},
@@ -265,7 +236,7 @@ class TestAddCaseComment:
 
 
 # ===========================================================================
-# nodes/case_action.py — content builder
+# stages/case_action.py — content builder
 # ===========================================================================
 
 
@@ -320,10 +291,8 @@ def make_verdict(
     recommended_action="create_case",
     **overrides,
 ) -> TriageVerdict:
-    """v6 (2026-09-06): correlation_decision/evidence_situation are built
-    directly into the verdict now — case_action.py reads everything off one
-    object. Default P2 matches the old make_priority()'s default (v5,
-    `newdesign.md` §6-§8)."""
+    """correlation_decision/evidence_situation are built directly into the
+    verdict — case_action.py reads everything off one object."""
     defaults = dict(
         correlation_decision=CorrelationDecision(
             action=action, merge_into_case_id=merge_into_case_id, reasoning="test correlation"
@@ -335,7 +304,7 @@ def make_verdict(
         reasoning="test reasoning",
         summary="test summary",
         recommended_action=recommended_action,
-        evidence_citations=["rule_context.severity=high"],
+        evidence_analysis="The rule matched a signed binary; Cortex analyzers returned nothing adverse.",
         priority_band="P2",
         priority_reasoning="test priority reasoning",
     )
@@ -345,7 +314,7 @@ def make_verdict(
 
 class TestBuildCaseContent:
     def test_title_includes_priority_rule_and_host(self):
-        """v5 (`newdesign.md` §8): title now leads with [priority_band]."""
+        """The case title leads with [priority_band]."""
         evidence = make_evidence()
         verdict = make_verdict(priority_band="P1")
         title = case_action_mod._build_case_title(verdict, evidence)
@@ -354,9 +323,9 @@ class TestBuildCaseContent:
         assert "win-test01" in title
 
     def test_title_excludes_alert_id(self):
-        """2026-09-07, user-directed reversal: the alert_id is NOT in the
-        case title — only priority/rule/host. It lives in the description
-        heading (asserted below) and in TriageResult.alert_id."""
+        """The alert_id is NOT in the case title — only priority/rule/host.
+        It lives in the description heading (asserted below) and in
+        TriageResult.alert_id."""
         evidence = make_evidence()
         verdict = make_verdict()
         title = case_action_mod._build_case_title(verdict, evidence)
@@ -373,11 +342,11 @@ class TestBuildCaseContent:
         assert "T1105" in desc
 
     def test_description_leads_with_alert_identity_heading(self):
-        """2026-09-07, user-directed: `_build_case_description` doubles as
-        the comment body on every merge (see `_case_action`'s `add_case_
-        comment` call) — without an alert_id/rule_name heading, a case with
-        several merged alerts has no way to tell which comment came from
-        which alert. Deterministic, from CanonicalAlert — not an LLM field."""
+        """`_build_case_description` doubles as the comment body on every
+        merge (see `_case_action`'s `add_case_comment` call) — without an
+        alert_id/rule_name heading, a case with several merged alerts has no
+        way to tell which comment came from which alert. Deterministic, from
+        CanonicalAlert — not an LLM field."""
         evidence = make_evidence()
         verdict = make_verdict()
         desc = case_action_mod._build_case_description(verdict, evidence)
@@ -385,10 +354,28 @@ class TestBuildCaseContent:
         assert "~1" in first_line
         assert "Suspicious Invoke-WebRequest Execution" in first_line
 
-    def test_description_includes_evidence_situation_and_gaps(self):
-        """v5 (`newdesign.md` §3-§4, §9) replaces the old contextual_modifiers
-        assertion — the description now surfaces evidence_situation and
-        priority_reasoning/investigation_gaps, all on the single verdict."""
+    def test_description_includes_evidence_analysis_priority_and_gaps(self):
+        """The case narrative carries the LLM's own `evidence_analysis` text
+        rather than a per-source "Evidence situation" reliability table.
+        priority_reasoning, investigation_gaps and the tool-gap list are
+        all included too."""
+        evidence = make_evidence()
+        verdict = make_verdict(
+            evidence_analysis="Signed Microsoft binary; VirusTotal returned 0/72; benign-leaning.",
+            priority_reasoning="P2 because confirmed malicious with no active spread",
+            investigation_gaps=["Verify fp_signal manually — tool unavailable"],
+        )
+        desc = case_action_mod._build_case_description(verdict, evidence)
+        assert "### Evidence analysis" in desc
+        assert "Signed Microsoft binary; VirusTotal returned 0/72; benign-leaning." in desc
+        assert "P2 because confirmed malicious with no active spread" in desc
+        assert "Verify fp_signal manually — tool unavailable" in desc
+        assert "opencti_observable_enrichment" in desc
+
+    def test_description_omits_evidence_situation_reliability_table(self):
+        """`verdict.evidence_situation` is still produced and surfaced in
+        the /triage JSON, but is not written into the TheHive case/alert
+        body."""
         evidence = make_evidence()
         verdict = make_verdict(
             evidence_situation=make_evidence_situation(
@@ -396,20 +383,23 @@ class TestBuildCaseContent:
                     {
                         "source_name": "fp_signal",
                         "status": "missing",
-                        "impact_on_triage": "fp_signal unavailable, cannot rule out known FP",
+                        "impact_on_triage": "SENTINEL_fp_signal_impact_string",
                     }
                 ],
                 overall_evidence_reliability="medium",
             ),
-            priority_reasoning="P2 because confirmed malicious with no active spread",
-            investigation_gaps=["Verify fp_signal manually — tool unavailable"],
         )
         desc = case_action_mod._build_case_description(verdict, evidence)
-        assert "fp_signal unavailable, cannot rule out known FP" in desc
-        assert "medium" in desc
-        assert "P2 because confirmed malicious with no active spread" in desc
-        assert "Verify fp_signal manually — tool unavailable" in desc
-        assert "opencti_observable_enrichment" in desc
+        assert "### Evidence situation" not in desc
+        assert "SENTINEL_fp_signal_impact_string" not in desc
+
+    def test_description_includes_alert_timestamp(self):
+        """The alert's own timestamp is in the narrative so an analyst
+        doesn't have to open the alert to see when it fired."""
+        evidence = make_evidence()
+        desc = case_action_mod._build_case_description(make_verdict(), evidence)
+        assert "**Alert timestamp:**" in desc
+        assert evidence.canonical_alert.timestamp.isoformat() in desc
 
     def test_tags_include_priority_verdict_and_mitre(self):
         evidence = make_evidence()
@@ -422,7 +412,7 @@ class TestBuildCaseContent:
 
 
 # ===========================================================================
-# nodes/case_action.py — dispatch logic
+# stages/case_action.py — dispatch logic
 # ===========================================================================
 
 
@@ -451,8 +441,8 @@ class TestCaseActionDispatch:
         assert result.case_id == "~new1"
         assert captured["called"] == "create"
         assert captured["severity"] == 4  # P1 -> hive severity 4
-        # v7 (2026-09-07): the Markdown written as the new case's
-        # description is echoed back on the result.
+        # The Markdown written as the new case's description is echoed back
+        # on the result.
         assert result.case_narrative == case_action_mod._build_case_description(
             verdict, evidence
         )
@@ -494,8 +484,8 @@ class TestCaseActionDispatch:
         assert result.comment_added is True
         assert captured["merge_case_id"] == "~existing1"
         assert captured["comment_case_id"] == "~existing1"
-        # v7 (2026-09-07): case_narrative is exactly the comment body posted
-        # to the merge target.
+        # case_narrative is exactly the comment body posted to the merge
+        # target.
         assert result.case_narrative == captured["comment_text"]
         assert result.case_narrative == case_action_mod._build_case_description(
             verdict, evidence
@@ -610,8 +600,8 @@ class TestCaseActionDispatch:
 
 
 class TestFalsePositiveAlertAction:
-    """2026-09-07, user-directed: verdict == "false_positive" -> annotate the
-    alert (comment + severity/tlp floor), never a case."""
+    """verdict == "false_positive" -> annotate the alert (comment +
+    severity/tlp floor), never a case."""
 
     def _patch_no_case(self, monkeypatch):
         async def boom(*a, **kw):
@@ -629,8 +619,11 @@ class TestFalsePositiveAlertAction:
             captured["comment"] = message
             return True, None
 
-        async def fake_update_alert(alert_id, *, severity=None, tlp=None, timeout=None):
-            captured["update"] = (alert_id, severity, tlp)
+        async def fake_update_alert(
+            alert_id, *, severity=None, tlp=None, status=None, summary=None, timeout=None
+        ):
+            captured["update"] = (alert_id, severity, tlp, status)
+            captured["update_summary"] = summary
             return True, None
 
         monkeypatch.setattr(th, "add_alert_comment", fake_alert_comment)
@@ -649,10 +642,13 @@ class TestFalsePositiveAlertAction:
         assert result.comment_added is True
         assert result.severity == 1
         assert result.tlp == 0
+        assert result.status == "FalsePositive"  # alert closed as FP
         assert captured["comment_alert_id"] == "~alertFP"
         assert captured["comment"] == case_action_mod._build_case_description(verdict, evidence)
         assert result.case_narrative == captured["comment"]
-        assert captured["update"] == ("~alertFP", 1, 0)  # forced low / clear
+        # forced low / clear AND closed as a false positive
+        assert captured["update"] == ("~alertFP", 1, 0, "FalsePositive")
+        assert "test summary" in captured["update_summary"]
 
     def test_fp_comment_failure_flips_success_but_still_tries_severity(self, monkeypatch):
         self._patch_no_case(monkeypatch)
@@ -662,7 +658,9 @@ class TestFalsePositiveAlertAction:
             calls.append("comment")
             return False, Gap(source="thehive", reason="comment 500", tool="add_alert_comment")
 
-        async def ok_update(alert_id, *, severity=None, tlp=None, timeout=None):
+        async def ok_update(
+            alert_id, *, severity=None, tlp=None, status=None, summary=None, timeout=None
+        ):
             calls.append("update")
             return True, None
 
@@ -683,7 +681,9 @@ class TestFalsePositiveAlertAction:
         async def ok_comment(alert_id, message, timeout=None):
             return True, None
 
-        async def fail_update(alert_id, *, severity=None, tlp=None, timeout=None):
+        async def fail_update(
+            alert_id, *, severity=None, tlp=None, status=None, summary=None, timeout=None
+        ):
             return False, Gap(source="thehive", reason="patch 403", tool="update_alert")
 
         monkeypatch.setattr(th, "add_alert_comment", ok_comment)
@@ -714,10 +714,9 @@ class TestFalsePositiveAlertAction:
         assert "thehive_alert_id" in result.error
 
     def test_against_real_captured_fp_run(self):
-        """REAL — `tests/fixtures/case_action_fp_live_run_real.json`: the real
-        `case_action` result from a live FP-path run against TheHive 5.7.5
-        (alert ~46149872, severity 3->1, tlp 2->0, narrative posted as an
-        alert comment), 2026-09-07."""
+        """Checks the captured `case_action` result from a real FP-path run
+        against TheHive (alert ~46149872, severity 3->1, tlp 2->0, narrative
+        posted as an alert comment)."""
         import json
         from pathlib import Path
 
@@ -734,12 +733,11 @@ class TestFalsePositiveAlertAction:
 
 
 # ===========================================================================
-# nodes/case_action.py::_write_actionable_observables (2026-08-23)
+# stages/case_action.py::_write_actionable_observables
 #
-# Replaces the old add_extracted_observables wiring — the LLM's per-item
-# judgment (verdict.actionable_observables, each with a confidence) is
-# written, with a dedup lookup against what's already on the case. See
-# case_action.py's module docstring for the full "why" of this change.
+# The LLM's per-item judgment (verdict.actionable_observables, each with a
+# confidence) is written, with a dedup lookup against what's already on the
+# case. See case_action.py's module docstring for the full "why".
 # ===========================================================================
 
 
@@ -864,9 +862,9 @@ class TestWriteActionableObservables:
         assert captured["data_type"] == "filename"
 
     def test_description_states_recommendation_and_reasoning(self, monkeypatch):
-        """2026-08-23, user-directed: the TheHive observable's message
-        (description) must state the recommended disposition up front,
-        followed by the LLM's reasoning — not reasoning alone."""
+        """The TheHive observable's message (description) must state the
+        recommended disposition up front, followed by the LLM's reasoning —
+        not reasoning alone."""
 
         async def fake_fetch(case_id, timeout=None):
             return [], None
@@ -894,10 +892,10 @@ class TestWriteActionableObservables:
         )
 
     def test_already_exists_conflict_reuses_id_instead_of_failing(self, monkeypatch):
-        """2026-08-23 live-caught race: TheHive's own alert-to-case import
-        can land between the pre-check fetch and our create call. On that
-        specific conflict, the item must be recovered via a re-fetch, not
-        marked failed."""
+        """Live-caught race: TheHive's own alert-to-case import can land
+        between the pre-check fetch and our create call. On that specific
+        conflict, the item must be recovered via a re-fetch, not marked
+        failed."""
         fetch_calls = []
 
         async def fake_fetch(case_id, timeout=None):
@@ -999,11 +997,9 @@ class TestWriteActionableObservables:
         assert captured["ioc"] is False
 
     def test_process_path_and_file_path_share_datatype_but_get_independent_tags(self, monkeypatch):
-        """Same trap the old bucket-write code documented (process/file both
-        map to dataType 'filename', so dataType alone can't drive the tag
-        decision) — now guarded against the new observable_type-keyed
-        mapping. "file" renamed "file-path" (v6, 2026-09-06) — same dataType,
-        no behavior change."""
+        """process-path and file-path both map to dataType 'filename', so
+        dataType alone can't drive the tag decision — the observable_type
+        itself must."""
 
         async def fake_fetch(case_id, timeout=None):
             return [], None
@@ -1029,7 +1025,7 @@ class TestWriteActionableObservables:
 
 
 # ===========================================================================
-# nodes/case_action.py — observable-write wiring: dispatched at all, against
+# stages/case_action.py — observable-write wiring: dispatched at all, against
 # the right case id, on both branches, gated behind a successful
 # create/merge, and its failure never fails the node. The write mechanism
 # itself is covered above in TestWriteActionableObservables.

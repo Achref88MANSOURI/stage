@@ -1,14 +1,7 @@
-"""Case-action output contract — a deployment addition, not in architecture
-v4. See `nodes/case_action.py`'s module docstring and CLAUDE.md's "Case
-action" entry for why this Python service writes to TheHive at all
-(architecture §1/§3's original design has n8n own every case mutation;
-2026-08-21, the user explicitly asked for this service to do it directly
-instead, and to always act — no `needs_review` hold-off).
-
-`CaseActionResult` is deliberately NOT a stage boundary in architecture's
-original sense (there's no §18 file map entry for it) — it's this
-deployment's own addition, following the same "typed Pydantic contract"
-discipline every other node output already uses.
+"""Case-action output contract. This service writes to TheHive directly —
+creating or merging cases, and annotating false-positive alerts — rather
+than leaving case mutation to an external workflow. See
+`stages/case_action.py`'s module docstring for the write behavior.
 """
 
 from __future__ import annotations
@@ -21,9 +14,9 @@ from schemas.verdict import ActionableObservable
 class CaseActionResult(BaseModel):
     success: bool
     # What this node actually did: "new_case" / "merge" (a case was created
-    # or merged into), or "fp_alert" — the 2026-09-07 branch where a
-    # `false_positive` verdict is annotated onto the alert in place (comment
-    # + severity/tlp) and NO case is touched. Empty on an early failure.
+    # or merged into), or "fp_alert" — a `false_positive` verdict is
+    # annotated onto the alert in place (comment + severity/tlp) and no case
+    # is touched. Empty on an early failure.
     action_taken: str = ""
     case_id: str = ""
     case_number: int | None = None
@@ -36,22 +29,16 @@ class CaseActionResult(BaseModel):
     comment_added: bool = False
     observables_written: int = 0
     observables_failed: int = 0
-    # The exact Markdown `nodes/case_action.py::_build_case_description`
-    # produced and wrote to TheHive — as the new case's `description` on a
-    # "new" action, or as the comment body on a "merge". Surfaced back in
-    # `TriageResult` (2026-09-07, user-directed) so the `/triage` caller has
-    # the narrative that landed in TheHive without a follow-up read. Empty
-    # string only on the failure paths, where nothing was written.
+    # The Markdown written to TheHive — the new case's description, or the
+    # merge comment body. Surfaced here so the /triage caller has it without
+    # a follow-up read. Empty only on the failure paths.
     case_narrative: str = ""
-    # 2026-08-23: Stage 4's full actionable_observables list, enriched with
-    # each item's real TheHive observable_id — reused from what was already
-    # on the case where a value matched, newly created otherwise. See
-    # nodes/case_action.py's module docstring. observables_written/_failed
-    # above count against THIS list now (an old-style bucket write of Stage
-    # 3's raw extraction no longer happens here at all).
+    # The verdict's actionable_observables, enriched with each item's real
+    # TheHive observable_id (reused if it already existed on the case,
+    # created otherwise). observables_written/_failed above count against
+    # this list.
     actionable_observables_written: list[ActionableObservable] = Field(default_factory=list)
-    # Set only when success=False — this node never raises to its caller,
-    # same contract as every tools/*.py function (Gap-shaped, but named
-    # `error` rather than reusing `Gap` since this isn't a Stage 1 gather
-    # gap — the alert always got triaged; only the case write itself failed).
+    # Set only on failure — this stage never raises, so a failed write shows
+    # up here rather than as an exception. The alert itself was still
+    # triaged; only the case write failed.
     error: str | None = None

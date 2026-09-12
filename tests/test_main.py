@@ -1,19 +1,17 @@
-"""`main.py` — the `/triage` HTTP entrypoint (architecture §3, file-tree spec).
+"""`main.py` — the `/triage` HTTP entrypoint.
 No node/tool internals are re-tested here (each already has its own test
 file) — this file only exercises `main.py`'s own orchestration logic: the
-Stage 1->6 call sequence, `TriageResult` assembly, and the "HTTP 200 always,
-success=False + failed_stage on any unexpected failure" posture (CLAUDE.md,
-2026-08-23 build writeup). Every node function is monkeypatched at its
+gather -> rag -> triage -> case_action call sequence, `TriageResult`
+assembly, and the "HTTP 200 always, success=False + failed_stage on any
+unexpected failure" posture. Every node function is monkeypatched at its
 `main.py` import site (`main.gather_mod`, `main.rag_mod`, etc. — `main.py`
-does `from nodes import gather as gather_mod` etc., the same
-patch-at-the-module-object convention `tests/test_gather.py` already uses),
-never the real backends.
+does `from stages import gather as gather_mod` etc., the same
+patch-at-the-module-object convention `tests/test_gather.py` uses), never
+the real backends.
 
-**v6 redesign (2026-09-06)**: `main.context_mod`/`main.analyze_mod` (the old
-Stage 3/Stage 4 modules) are gone — `main.triage_mod.single_stage_triage`
-replaces both, producing one `TriageVerdict` instead of a
-`ContextualAssessment`+`TriageVerdict` pair. `case_action_mod.case_action`
-now takes `(verdict, evidence)`, not `(verdict, context, evidence)`.
+`main.triage_mod.single_stage_triage` produces one `TriageVerdict` from
+`EnrichedEvidence` directly. `case_action_mod.case_action` takes
+`(verdict, evidence)`.
 """
 
 from __future__ import annotations
@@ -40,7 +38,6 @@ from schemas import (
     RawEvidence,
     Rule,
     TriageVerdict,
-    User,
 )
 
 client = TestClient(main.app)
@@ -57,7 +54,6 @@ def make_alert() -> CanonicalAlert:
         timestamp=datetime.now(timezone.utc),
         rule=Rule(name="test rule", uuid="x"),
         host=Host(hostname="win-test"),
-        user=User(name="tester"),
     )
 
 
@@ -67,9 +63,8 @@ def make_evidence() -> EnrichedEvidence:
 
 
 def make_verdict(**overrides) -> TriageVerdict:
-    """v6 (2026-09-06): correlation_decision/evidence_situation are required
-    fields directly on TriageVerdict now — the old separate make_context()
-    helper is folded in here."""
+    """`correlation_decision`/`evidence_situation` are required fields
+    directly on `TriageVerdict`."""
     defaults = dict(
         correlation_decision=CorrelationDecision(action="new", reasoning="x"),
         evidence_situation=EvidenceSituation(
@@ -118,9 +113,9 @@ class TestHappyPath:
         monkeypatch.setattr(main.gather_mod, "gather_evidence", fake_gather)
         monkeypatch.setattr(main.rag_mod, "rag_enrichment", fake_rag)
         monkeypatch.setattr(main.triage_mod, "single_stage_triage", fake_triage)
-        # v5 (newdesign.md §5) — no more score_mod: _build_triage_result is a
-        # pure, math-free function in main.py itself, run for real here (no
-        # I/O, deterministic from the already-mocked verdict).
+        # _build_triage_result is a pure, math-free function in main.py
+        # itself, run for real here (no I/O, deterministic from the
+        # already-mocked verdict).
         monkeypatch.setattr(main.case_action_mod, "case_action", fake_case_action)
 
         resp = client.post("/triage", json=PAYLOAD)
@@ -137,9 +132,9 @@ class TestHappyPath:
         assert body["result"]["is_new_case"] is True
 
     def test_response_shape_v7_trim(self, monkeypatch):
-        """v7 (2026-09-07): no raw evidence / flat cortex list in the
-        response; ioc:true observables carry their analyzer results, and the
-        case narrative comes back on case_action."""
+        """No raw evidence / flat cortex list in the response; `ioc:true`
+        observables carry their analyzer results, and the case narrative
+        comes back on `case_action`."""
 
         alert = make_alert()
         alert.cortex_results = [
@@ -185,8 +180,8 @@ class TestHappyPath:
         assert result["case_action"]["case_narrative"] == "## Triage Summary — Alert `~1`"
 
     def test_degraded_hive_alert_fetch_does_not_block_success(self, monkeypatch):
-        """A Gap from get_full_alert_with_analysis is logged, not fatal —
-        matches that function's own NEVER RAISES contract."""
+        """A Gap from get_full_alert_with_analysis should be logged, not
+        treated as fatal — that function never raises to its caller."""
 
         async def fake_get_full_alert(thehive_alert_id, timeout=None):
             return None, Gap(source="thehive", tool="get_full_alert_with_analysis", reason="down")
@@ -241,8 +236,8 @@ class TestFailurePosture:
         assert body["result"] is None
 
     def test_failure_after_score_preserves_partial_result(self, monkeypatch):
-        """A failure in case_action (Stage 6) must not discard the Stage 5
-        TriageResult already built — n8n still gets the score/verdict."""
+        """A failure in case_action must not discard the TriageResult already
+        built — n8n still gets the verdict."""
 
         async def fake_gather(alert):
             return RawEvidence(canonical_alert=alert)
@@ -270,22 +265,16 @@ class TestFailurePosture:
 
 
 class TestV7ResponseAgainstRealCapturedResponse:
-    """REAL — the full `POST /triage` JSON response for TheHive alert
-    `~4739200` ([MEDIUM] Suspicious Schtasks Schedule Type With High
-    Privileges, desktop-8f2igk2), captured live 2026-09-07 against real
-    ES/TheHive/iTop/OpenCTI/Qdrant backends.
+    """Uses the full `POST /triage` JSON response for a real TheHive alert
+    ([MEDIUM] Suspicious Schtasks Schedule Type With High Privileges),
+    captured against real ES/TheHive/iTop/OpenCTI/Qdrant backends.
 
-    The Gemini triage call hit a real `429 Too Many Requests` at capture
-    time (the session had been probing it heavily), so `verdict` /
-    `triage_assessment` are the deterministic fallback — that does not
-    matter here: this fixture locks the response SHAPE, which is entirely
-    code-driven. `case_action` is the real `400 "Alert is already imported"`
-    (this alert was previously merged into case `~45391936`).
-
-    A separate real, non-fallback gemini-3.6-flash run (74.7s,
-    finish_reason=stop, verdict needs_review / merge_quiet / P3, MITRE
-    T1053.005) was verified live the same session but not kept as the
-    fixture since it predated the top-level `case_id` fields."""
+    The triage LLM call hit a rate limit at capture time, so `verdict` and
+    `triage_assessment` are the deterministic fallback values — that doesn't
+    matter here, since this fixture is only checking the response shape,
+    which is entirely code-driven. `case_action` reflects a real
+    `400 "Alert is already imported"` response, since this alert was already
+    merged into case `~45391936`."""
 
     def test_v7_shape_contract(self):
         body = json.loads((FIXTURES / "main_triage_response_v7_real.json").read_text())
@@ -313,10 +302,10 @@ class TestV7ResponseAgainstRealCapturedResponse:
         assert "case_narrative" in result["case_action"]
 
     def test_case_identity_is_at_the_top_level(self):
-        """2026-09-07, user-directed: case id + number sit next to alert_id.
-        This real capture is a merge into case `~45391936` (#58) — surfaced
-        even though the merge itself failed (already-imported), because the
-        id/number come from `evidence.open_cases`, resolved before the call."""
+        """Case id + number sit next to `alert_id`. This real capture is a
+        merge into case `~45391936` (#58) — surfaced even though the merge
+        itself failed (already-imported), because the id/number come from
+        `evidence.open_cases`, resolved before the call."""
         result = json.loads(
             (FIXTURES / "main_triage_response_v7_real.json").read_text()
         )["result"]
@@ -346,17 +335,16 @@ def _patch_happy_stages(monkeypatch, verdict: TriageVerdict, *, alert: Canonical
 
 
 class TestFPFeedbackLoop:
-    """`_record_fp_feedback` — wired 2026-09-07, user-directed. Verifies
-    run_pipeline calls `tools.fp_tracking.record_triage_outcome` exactly when
-    the verdict is `false_positive`, keyed on `rule.uuid`/`host.hostname`,
-    and that neither a skip nor a write failure ever flips the response's
-    own `success` to False."""
+    """`_record_fp_feedback` verifies run_pipeline calls
+    `tools.fp_tracking.record_triage_outcome` exactly when the verdict is
+    `false_positive`, keyed on `rule.uuid`, and that neither a skip nor a
+    write failure ever flips the response's own `success` to False."""
 
     def test_false_positive_verdict_records_fp_feedback(self, monkeypatch):
         calls = []
 
-        async def fake_record(rule_uuid, host, analyst_reason=None, timeout=None, **kw):
-            calls.append((rule_uuid, host, analyst_reason))
+        async def fake_record(rule_uuid, analyst_reason=None, timeout=None, **kw):
+            calls.append((rule_uuid, analyst_reason))
             return True, None
 
         monkeypatch.setattr(main.fp_tracking, "record_triage_outcome", fake_record)
@@ -366,7 +354,7 @@ class TestFPFeedbackLoop:
 
         assert resp.status_code == 200
         assert resp.json()["success"] is True
-        assert calls == [("x", "win-test", "benign scan")]
+        assert calls == [("x", "benign scan")]
 
     def test_true_positive_verdict_does_not_record_fp_feedback(self, monkeypatch):
         async def fake_record(*args, **kwargs):
@@ -395,22 +383,21 @@ class TestFPFeedbackLoop:
         assert resp.status_code == 200
         assert resp.json()["success"] is True
 
-    def test_missing_host_skips_the_write_without_failing(self, monkeypatch):
-        """Suricata-shaped alerts carry no host at all (CLAUDE.md's own
-        documented gap) — the write must be skipped, logged, not attempted,
-        and must not fail the response."""
+    def test_missing_rule_uuid_skips_the_write_without_failing(self, monkeypatch):
+        """A rule that never resolved a uuid carries `rule.uuid == ""` — the
+        write must be skipped, logged, not attempted, and must not fail the
+        response."""
         async def fake_record(*args, **kwargs):
-            raise AssertionError("record_triage_outcome must not be called with no host")
+            raise AssertionError("record_triage_outcome must not be called with no rule_uuid")
 
         monkeypatch.setattr(main.fp_tracking, "record_triage_outcome", fake_record)
-        hostless_alert = CanonicalAlert(
+        ruleless_alert = CanonicalAlert(
             alert_id="~1",
             timestamp=datetime.now(timezone.utc),
-            rule=Rule(name="test rule", uuid="x"),
-            host=None,
+            rule=Rule(name="test rule", uuid=""),
         )
         _patch_happy_stages(
-            monkeypatch, make_verdict(verdict="false_positive"), alert=hostless_alert
+            monkeypatch, make_verdict(verdict="false_positive"), alert=ruleless_alert
         )
 
         resp = client.post("/triage", json=PAYLOAD)
@@ -420,9 +407,9 @@ class TestFPFeedbackLoop:
 
     def test_write_failure_does_not_fail_the_response(self, monkeypatch):
         """A Gap from record_triage_outcome (e.g. a locked/corrupt SQLite
-        file) is logged, not fatal — matches that function's own NEVER
-        RAISES contract and this write's best-effort posture."""
-        async def fake_record(rule_uuid, host, analyst_reason=None, timeout=None, **kw):
+        file) should be logged, not treated as fatal — this write is
+        best-effort."""
+        async def fake_record(rule_uuid, analyst_reason=None, timeout=None, **kw):
             return False, Gap(source="fp_tracking", tool="record_triage_outcome", reason="db locked")
 
         monkeypatch.setattr(main.fp_tracking, "record_triage_outcome", fake_record)
@@ -434,9 +421,9 @@ class TestFPFeedbackLoop:
         assert resp.json()["success"] is True
 
     def test_write_raising_unexpectedly_does_not_fail_the_response(self, monkeypatch):
-        """Belt-and-suspenders: even if record_triage_outcome broke its own
-        NEVER RAISES contract, _record_fp_feedback's own try/except must
-        still keep the pipeline's success outcome intact."""
+        """Even if record_triage_outcome unexpectedly raised,
+        _record_fp_feedback's own try/except should keep the pipeline's
+        success outcome intact."""
         async def fake_record(*args, **kwargs):
             raise RuntimeError("simulated bug")
 
@@ -469,8 +456,10 @@ class TestFalsePositiveEndToEnd:
             calls["comment"] = alert_id
             return True, None
 
-        async def fake_update_alert(alert_id, *, severity=None, tlp=None, timeout=None):
-            calls["update"] = (alert_id, severity, tlp)
+        async def fake_update_alert(
+            alert_id, *, severity=None, tlp=None, status=None, summary=None, timeout=None
+        ):
+            calls["update"] = (alert_id, severity, tlp, status)
             return True, None
 
         monkeypatch.setattr(main.fp_tracking, "record_triage_outcome", fake_record)
@@ -501,13 +490,15 @@ class TestFalsePositiveEndToEnd:
 
         assert calls["fp_feedback"] is True
         assert calls["comment"] == "~alertFP"
-        assert calls["update"] == ("~alertFP", 1, 0)  # forced low / clear
+        # forced low / clear AND closed as a false positive
+        assert calls["update"] == ("~alertFP", 1, 0, "FalsePositive")
         assert result["verdict"] == "false_positive"
         assert result["case_id"] == ""
         assert result["is_new_case"] is False
         assert result["case_action"]["action_taken"] == "fp_alert"
         assert result["case_action"]["severity"] == 1
         assert result["case_action"]["tlp"] == 0
+        assert result["case_action"]["status"] == "FalsePositive"
 
 
 class TestHealth:

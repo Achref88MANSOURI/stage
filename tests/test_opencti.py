@@ -1,17 +1,12 @@
-"""`opencti_observable_enrichment` — a deployment-added Stage-1 tool, not in
-architecture v4's original 7. See CLAUDE.md "Deployment-specific decisions:
-OpenCTI" and `tools/opencti.py`'s module docstring.
+"""Tests for `opencti_observable_enrichment`. See `tools/opencti.py`'s module
+docstring for the tool's own contract.
 
-PROVENANCE: `tests/fixtures/opencti_real.json` is REAL, captured live from
-OpenCTI GraphQL 7.260318.0 at `172.20.24.222:8080` on 2026-08-13. A single
-batched query for 4 values — two real threat-feed domains that resolve
-(`w8p3k.com`, `yezi.haoyun.bar`) and two of this deployment's own alert
-observables that do not (`github.com`, the alert's own sha256 hash) — proves
-both the "found" and "not found" paths from ONE real call, and proves batched
-exact-match filtering returns only genuine matches (4 values in, 2 edges out).
-The tool itself was called live against the real backend before any of these
-tests were written (implementation guide §2) — see the module docstring in
-tools/opencti.py for the live smoke-test results.
+`tests/fixtures/opencti_real.json` was captured from a live OpenCTI GraphQL
+query at 172.20.24.222:8080: a single batched query for 4 values, two real
+threat-feed domains that resolve and two of this deployment's own alert
+observables that don't. That single call exercises both the "found" and
+"not found" paths, and confirms batched exact-match filtering returns only
+genuine matches (4 values in, 2 edges out).
 """
 
 from __future__ import annotations
@@ -32,7 +27,7 @@ FIXTURE = Path(__file__).parent / "fixtures" / "opencti_real.json"
 
 @pytest.fixture(scope="module")
 def real() -> dict:
-    """REAL — captured live from OpenCTI on 2026-08-13."""
+    """Captured live from OpenCTI."""
     return json.loads(FIXTURE.read_text())
 
 
@@ -70,9 +65,9 @@ class TestRealBatchedLookup:
         assert by_value["yezi.haoyun.bar"].found is True
 
     def test_real_non_matches_are_found_false_not_a_gap(self, monkeypatch, real_edges):
-        """github.com and the alert's own sha256 hash genuinely aren't in this
-        OpenCTI instance's data. That's a real, checked-and-empty answer, not
-        a broken query — proven by the SAME call finding two real matches."""
+        """github.com and the alert's own sha256 hash aren't in this OpenCTI
+        instance's data. That's a checked-and-empty answer, not a broken
+        query, since the same call also finds two real matches."""
         obs = Observables(
             domains=["github.com"],
             hashes=HashBundle(
@@ -95,9 +90,9 @@ class TestRealBatchedLookup:
         self, monkeypatch, real_edges
     ):
         """The real payload's `based-on` relationship resolves to an empty
-        `to {}` (the target is another Indicator, not a Malware/IntrusionSet/
-        ThreatActor/Campaign the inline fragments select on). That must be
-        silently dropped from `relations`, not surfaced as noise or an error."""
+        `to {}` (its target is another Indicator, not one of the entity
+        types the inline fragments select on) and should be dropped from
+        `relations` rather than surfaced as noise or an error."""
         obs = Observables(domains=["w8p3k.com"])
         patch_query(monkeypatch, edges=real_edges)
         results, _ = run(opencti_observable_enrichment(obs))
@@ -148,8 +143,8 @@ class TestFailureModes:
         assert "Cannot connect to OpenCTI" in gap.reason
 
     def test_graphql_auth_error_is_a_gap_not_a_crash(self, monkeypatch):
-        """The real shape a bad token returns (found live 2026-08-13 with the
-        typo'd .mcp.json token): HTTP 200, `errors: [{code: AUTH_REQUIRED}]`."""
+        """The real shape a bad token returns: HTTP 200,
+        `errors: [{code: AUTH_REQUIRED}]`."""
         request = httpx.Request("POST", "http://octi/graphql")
         response = httpx.Response(
             200,
@@ -193,10 +188,8 @@ class TestNodeMapping:
         assert names == {"Emotet", "APT99"}
 
     def test_no_score_is_ever_computed_here(self):
-        """A number DOES pass through (opencti_score), but it is OpenCTI's own
-        foreign value, never derived from anything in this module — mirrors
-        CortexResult.raw's treatment of foreign data. Confirmed by construction:
-        no arithmetic on any field happens in _node_to_enrichment."""
+        """opencti_score passes through as OpenCTI's own value; nothing in
+        this module derives or adjusts it."""
         from tools.opencti import _node_to_enrichment
 
         node = {"observable_value": "x", "x_opencti_score": None}

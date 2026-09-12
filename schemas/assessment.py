@@ -1,19 +1,5 @@
-"""Shared building-block models for the unified triage output —
-`schemas/verdict.py::TriageVerdict` (v6, single-call redesign, 2026-09-06).
-
-`MitreMapping`, `CorrelationDecision`, `EvidenceSource`, `EvidenceSituation`
-were originally Stage 3's own output contract (`ContextualAssessment`, now
-DELETED — the two-call Stage 3/Stage 4 split it belonged to is gone, see
-`nodes/triage.py`'s module docstring). They're kept here, unchanged in
-shape, as the building blocks the new single-call `TriageVerdict` composes
-directly.
-
-`ExtractedObservable`/`ExtractedObservables` (the old 6-bucket raw-extraction
-step, Stage 3's TASK 4) are ALSO DELETED, not kept — v6 redefines observable
-extraction to directly produce `TriageVerdict.actionable_observables`
-(`schemas/verdict.py::ActionableObservable`), replacing both the old
-raw-extraction step and old Stage 4's separate disposition judgment in one
-pass. Nothing in the new design constructs the old bucketed shape any more.
+"""Shared building-block models composed by `schemas/verdict.py::TriageVerdict`,
+the triage LLM call's output contract.
 """
 
 from __future__ import annotations
@@ -24,6 +10,8 @@ from pydantic import BaseModel
 
 
 class MitreMapping(BaseModel):
+    """One MITRE ATT&CK technique the LLM has confirmed against the evidence."""
+
     technique_id: str
     technique_name: str = ""
     tactic: str = ""
@@ -32,6 +20,8 @@ class MitreMapping(BaseModel):
 
 
 class CorrelationDecision(BaseModel):
+    """Whether this alert should open a new case or merge into an existing one."""
+
     action: Literal["new", "merge"]
     merge_into_case_id: str | None = None
     kill_chain_progression_detected: bool = False
@@ -39,11 +29,9 @@ class CorrelationDecision(BaseModel):
 
 
 class EvidenceSource(BaseModel):
-    """One Stage 1 evidence source's status, per the v5/v6 evidence-quality
-    TASK. `"present"`/`"empty"` vs `"missing"` is the load-bearing
-    distinction: "checked and found nothing" (real, exculpatory-or-neutral
-    signal) is never the same thing as "could not check" (a reliability
-    gap) — see `EvidenceSituation`'s docstring."""
+    """One gathered evidence source's status. "Empty" (checked, found
+    nothing) and "missing" (couldn't check) are kept distinct, since only
+    the latter is a reliability gap."""
 
     source_name: str
     status: Literal["present", "empty", "missing"]
@@ -51,18 +39,16 @@ class EvidenceSource(BaseModel):
 
 
 class EvidenceSituation(BaseModel):
-    """`sources` covers 6 Stage 1 evidence sources: `fp_signal`,
-    `rule_context`, `open_cases`, `asset_context`, `related_alerts_1h`,
-    `opencti_enrichment` (`cortex_results`, a property on `canonical_alert`
-    rather than a Stage 1 tool, is assessed too per the prompt's special-case
-    instructions but has no dedicated `EvidenceSource` slot of its own the
-    way the 6 named tools do).
+    """The LLM's assessment of the evidence it was given. `sources` covers
+    the 5 gathered evidence sources (`fp_signal`, `rule_context`,
+    `open_cases`, `asset_context`, `opencti_enrichment`); Cortex results are
+    assessed too but have no dedicated slot, since they arrive as a property
+    on the alert rather than a separate gathered result.
 
-    `overall_evidence_reliability` drives the priority floor ("low" forbids
-    P4/P5, enforced first by prompt instruction and then by
-    `nodes/triage.py::_apply_safety_backstop` as a deterministic backstop).
-    `analyst_must_verify` is the model's own list of concrete
-    manual-verification tasks — every item must reappear verbatim in
+    `overall_evidence_reliability` sets a floor on priority: "low" rules out
+    P4/P5, enforced both by the prompt and, as a backstop, by
+    `stages/triage.py::_apply_safety_backstop`. `analyst_must_verify` is the
+    model's list of manual follow-ups, which must also appear in
     `TriageVerdict.investigation_gaps`."""
 
     sources: list[EvidenceSource]

@@ -1,90 +1,36 @@
-"""`itop_asset_lookup` — architecture §6 tool 5, §13.
+"""Resolves an alert's host to its CMDB asset in iTop, for the
+asset-criticality side of triage reasoning.
 
-Resolves the alert's host to a CMDB asset and returns its business context.
-Feeds the `impact` dimension of architecture §10's scoring formula.
+Looks up by asset number first, falling back to hostname (see `_locate`
+below). Authentication is username/password (`ITOP_USER`/`ITOP_PWD`), not an
+API key.
 
-**DEPLOYMENT CHANGE 2026-08-14: this is a different iTop instance than the one
-this tool was originally verified against.** The 2026-08-08 verification was
-against `http://172.20.24.223/itop` (`PC::32` / `win-kvkmd51ggkq`, a real host).
-That instance is gone. The currently configured backend
-(`config.ITOP_URL` = `http://172.20.24.220:8080`, auth is username+password —
-`ITOP_USER`/`ITOP_PWD`, not an API key) is the **stock iTop community demo
-dataset**: `Server1`-`4`, `VM1`-`4`, `ESX1`-`3` (Hypervisor), `Router1`/
-`Switch1` (NetworkDevice), `Cluster1`/`2` (Farm), plus software/app-layer
-objects (WebServer, ApplicationSolution, DatabaseSchema, WebApplication,
-DBServer, Rack) that are not host-like and are not lookup targets here. There
-is **no `PC` class in this instance** — re-verified live 2026-08-14 via
-`core/get` on `Server`, `VirtualMachine`, `NetworkDevice`, `Hypervisor`.
-Captured responses: `tests/fixtures/itop_demo_real.json`.
+This deployment runs the stock iTop community demo dataset (`Server1`-`4`,
+`VM1`-`4`, hypervisors, network devices, no `PC` class), with no real host
+records populated yet. A lookup miss on a real Security Onion alert reflects
+that missing data, not a bug, and adding real records later requires no code
+changes here. A few fields are also simply not available on this instance:
+there's no IP-based lookup at all (`managementip` is blank everywhere and no
+IPv4Address/IPv4Subnet class exists), and `network_zone`, `data_sensitivity`,
+and `owner` aren't attributes on any class. None of these should be
+synthesized from other data (e.g. deriving `network_zone` from a subnet
+map) — an absent field should stay absent, not be guessed at.
 
-Practical consequence: none of this demo data's hostnames will ever match a
-real Security Onion alert's `host.name` (which looks like `win-kvkmd51ggkq`,
-not `Server1`). Until this iTop is populated with real asset records for real
-hosts, `itop_asset_lookup` will return `found=False` for every production
-alert. That is a data-population fact about *this* backend, same conclusion
-architecture §17 already draws about iTop generally — not a code bug, and not
-something to code around.
+`asset_type` has no single source field across classes, so it falls back
+through `type`, then `networkdevicetype_name` (the real "kind of device"
+field on `NetworkDevice`, e.g. `"Router"`), then `model_name`. Virtual
+machines and hypervisors carry none of the three, so `asset_type` stays
+`None` for those.
 
-WHAT THIS iTOP DOES NOT HAVE — re-verified 2026-08-14, not assumed:
-
-    network_zone       no such attribute on any class; the IP Management
-                       extension is absent (`IPv4Subnet`/`IPv4Address` are not
-                       valid classes)
-    data_sensitivity   no such attribute on any class
-    owner              no owner attribute; contacts_list is empty on every
-                       object sampled (Server1, VM1, Router1, ESX1)
-    ip addresses       `managementip` exists as an attribute on Server/
-                       NetworkDevice but is blank on every object; PhysicalInterface
-                       returns 0 rows. IP is NOT a usable lookup key.
-    asset_number       exists as an attribute (it's a `PhysicalDevice` field,
-                       same as before) but is BLANK on every object checked
-                       (all 4 Servers, Router1) — same empty-field situation as
-                       `ip_addresses`/`owner` above, just re-discovered on a
-                       different instance. The asset_number-primary /
-                       hostname-fallback lookup strategy below is kept as-is:
-                       it is forward-compatible (starts working the moment
-                       asset_number is populated) and costs nothing when it
-                       isn't.
-
-These are a DATA-POPULATION task, not a code one (architecture §17). When
-custom fields or real asset records are added in iTop the extension here is
-purely additive: one extra field read, same return model, no downstream
-change. Subnet maps must NOT be introduced anywhere to synthesise
-`network_zone`.
-
-`asset_type` has no single source field across classes in this schema (unlike
-the old `PC` class, which had a literal `type` attribute, e.g. `"desktop"` —
-see the superseded `type: "desktop"` in the old fixture, kept only as a
-historical note). Priority order, live-verified: `type` (still checked first,
-for forward-compat with any future `PC`-like class) -> `networkdevicetype_name`
-(populated on `NetworkDevice`, e.g. `"Router"` for Router1 — this is that
-class's actual "what kind of device" field) -> `model_name` (populated on
-`Server`/`NetworkDevice`, e.g. `"DL380"` — the closest fallback for classes
-with neither). `VirtualMachine`/`Hypervisor` have none of the three, so
-`asset_type` is `None` for those.
-
-TWO THINGS THE REAL API DOES THAT ARE EASY TO GET WRONG (still true on this
-instance, re-verified 2026-08-14):
-
-1. `output_fields: "*"` returns only the attributes of the CLASS YOU QUERY, not
-   of the object's actual subclass. Querying `FunctionalCI` for `Server::1`
-   returns none of `os_family`/`location`/`model_name` even though the Server
-   has them, and querying `PhysicalDevice` for asset_number would miss
-   `osfamily_name` too. Hence the two-phase lookup below: locate, then
-   re-fetch on `finalclass`.
-
-2. `asset_number` is not a filterable attribute on `FunctionalCI` — the API
-   rejects it. The exact wrapper text changed on this iTop version/build (now
-   `"Query failed to execute: ... exception_class = OqlNormalizeException,
-   exception_message = Unknown filter code - found 'asset_number' ..."`,
-   previously just `"Unknown filter code - found 'asset_number' ..."` directly)
-   — `"Unknown filter code"` is still a substring of the message either way,
-   which is what the code/tests match on; re-verified live 2026-08-14, real
-   response in `tests/fixtures/itop_demo_real.json["error_unknown_filter"]`.
-   `asset_number` exists on `PhysicalDevice` and its subclasses only.
-   `VirtualMachine` does not have it at all (VMs derive from VirtualDevice, not
-   PhysicalDevice), so the UUID join cannot match a VM and the hostname
-   fallback is what covers them.
+Two real API behaviors are worth knowing before touching this file:
+`output_fields: "*"` only returns the attributes of the class actually
+queried, not of the object's real subclass — querying `FunctionalCI` misses
+fields only `Server` has, and vice versa — which is why the lookup below is
+two-phase: locate, then re-fetch on the object's `finalclass`. And
+`asset_number` is not a filterable attribute on `FunctionalCI` (the API
+rejects it with an `OqlNormalizeException`); it only exists on
+`PhysicalDevice` and its subclasses, which `VirtualMachine` is not one of —
+hence the hostname fallback for VMs.
 """
 
 from __future__ import annotations
@@ -107,7 +53,7 @@ SOURCE = "itop"
 
 REST_VERSION = "1.3"
 
-# Observed across all 32 live CIs on 2026-08-08: low (27), medium (2), high (3).
+# The observed set of business_criticity values across this instance's CIs.
 # iTop's OQL does not validate enum values in a WHERE clause (an invalid value
 # returns 0 rows rather than an error), so this is an observed set, not a
 # schema-derived one. An unseen value is passed through unchanged and logged,
@@ -256,14 +202,13 @@ async def _locate(hostname: str | None, host_id: str | None, timeout: float):
     is threaded out because the caller needs it to decide whether a re-fetch on
     the real subclass is required — see `_refetch_on_final_class`.
 
-    `asset_number` is tried first because, when populated, it's a stable UUID
-    that matched `event_data.host.id` exactly on a real alert against the old
-    deployment's iTop, whereas hostname comparison in OQL `=` is case-sensitive
-    and breaks on FQDN vs short name. On the *current* deployment's instance
-    `asset_number` is blank on every object (module docstring) so this branch
-    never matches today — it's kept because it's free and forward-compatible.
-    It must be queried on `PhysicalDevice`; it is not filterable on
-    `FunctionalCI`.
+    `asset_number` is tried first because, when populated, it's a stable
+    identifier that can match an alert's host id exactly, whereas hostname
+    comparison in OQL `=` is case-sensitive and breaks on FQDN vs short name.
+    On this instance `asset_number` is blank on every object (see module
+    docstring) so this branch never matches today — it's kept because it's
+    free and forward-compatible. It must be queried on `PhysicalDevice`; it
+    is not filterable on `FunctionalCI`.
 
     The hostname fallback queries `FunctionalCI` deliberately — the broadest
     class — so that a VirtualMachine (which has no `asset_number`) or any other
@@ -337,15 +282,14 @@ async def itop_asset_lookup(
     timeout: float | None = None,
 ) -> tuple[AssetContext, Gap | None]:
     """Look up an asset by Elastic Agent host UUID, falling back to hostname.
-
-    NEVER RAISES. Returns `(AssetContext, Gap | None)`:
+    Never raises. Returns `(AssetContext, Gap | None)`:
 
     - found        -> `(populated AssetContext, Gap | None)`. A Gap is STILL
                       returned alongside a successful lookup when the asset has
-                      no criticality, because architecture §10's impact scoring
-                      silently degrades to a constant in that case and §17 calls
-                      that the single biggest deployment risk. A found-but-blank
-                      asset must not look like a fully successful lookup.
+                      no criticality, because impact reasoning silently
+                      degrades to a baseline in that case — a real risk worth
+                      surfacing. A found-but-blank asset must not look like a
+                      fully successful lookup.
     - not in CMDB  -> `(AssetContext(found=False), Gap)` — a real result, not a
                       failure, and its reason says so.
     - backend fail -> `(AssetContext(found=False), Gap)` with the transport error

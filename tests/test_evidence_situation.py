@@ -1,17 +1,8 @@
-"""`EvidenceSituation`/`EvidenceSource` — v5 redesign (`newdesign.md` §3).
-
-Two things are covered here: the models themselves (construction, literal
-enums), and `nodes/triage.py::_stage_fallback`'s deterministic build of
-`evidence_situation` from `evidence.investigation_gaps` when the LLM call
-itself fails — the one place in this codebase that constructs an
-`EvidenceSituation` without an LLM in the loop.
-
-**v6 redesign (2026-09-06)**: `nodes/context.py::_stage_3_fallback` (deleted)
-is replaced by `nodes/triage.py::_stage_fallback` — same deterministic
-missing-vs-present logic, now producing the single `TriageVerdict` directly
-instead of a separate `ContextualAssessment`. `ContextualAssessment` itself
-is deleted; the "evidence_situation is required" guard now targets
-`TriageVerdict`.
+"""Tests for the `EvidenceSituation` / `EvidenceSource` models and for
+`stages/triage.py::_stage_fallback`'s deterministic construction of
+`evidence_situation` when the LLM call fails. The fallback path builds the
+same missing/present distinction directly from `investigation_gaps`,
+without an LLM in the loop.
 """
 
 from __future__ import annotations
@@ -22,7 +13,7 @@ from datetime import datetime, timezone
 import httpx
 import pytest
 
-from nodes import triage as triage_mod
+from stages import triage as triage_mod
 from schemas import (
     CanonicalAlert,
     EnrichedEvidence,
@@ -98,11 +89,9 @@ class TestEvidenceSituationConstruction:
 
 
 class TestStageFallbackBuildsEvidenceSituation:
-    """nodes/triage.py::_stage_fallback — the deterministic,
-    LLM-independent construction of evidence_situation when the triage LLM
-    call itself fails. Mirrors TASK 3's missing-vs-present distinction, but
-    built purely from evidence.investigation_gaps (Gap.tool), since there is
-    no LLM output to draw a status judgment from at all on this path."""
+    """`_stage_fallback` builds `evidence_situation` deterministically from
+    `investigation_gaps` when the triage LLM call fails, using the same
+    missing/present distinction the LLM path applies."""
 
     def test_reliability_is_always_low(self, monkeypatch):
         async def raising_call_llm(evidence):
@@ -123,7 +112,7 @@ class TestStageFallbackBuildsEvidenceSituation:
         assert len(verdict.evidence_situation.analyst_must_verify) >= 1
         assert "Triage LLM call failed" in verdict.evidence_situation.analyst_must_verify[0]
 
-    def test_all_six_sources_are_covered(self, monkeypatch):
+    def test_all_five_sources_are_covered(self, monkeypatch):
         async def raising_call_llm(evidence):
             raise httpx.ConnectError("simulated")
 
@@ -136,7 +125,6 @@ class TestStageFallbackBuildsEvidenceSituation:
             "rule_context",
             "open_cases",
             "asset_context",
-            "related_alerts_1h",
             "opencti_enrichment",
         }
 
@@ -145,27 +133,27 @@ class TestStageFallbackBuildsEvidenceSituation:
             raise httpx.ConnectError("simulated")
 
         monkeypatch.setattr(triage_mod, "_call_llm", raising_call_llm)
-        gap = Gap(source="elasticsearch", reason="timeout after 5s", tool="related_alerts_1h")
+        gap = Gap(source="itop", reason="timeout after 5s", tool="asset_context")
         verdict = run(triage_mod.single_stage_triage(make_evidence(investigation_gaps=[gap])))
 
         by_name = {s.source_name: s for s in verdict.evidence_situation.sources}
-        assert by_name["related_alerts_1h"].status == "missing"
+        assert by_name["asset_context"].status == "missing"
 
     def test_source_not_named_in_any_gap_is_present(self, monkeypatch):
         async def raising_call_llm(evidence):
             raise httpx.ConnectError("simulated")
 
         monkeypatch.setattr(triage_mod, "_call_llm", raising_call_llm)
-        gap = Gap(source="elasticsearch", reason="timeout after 5s", tool="related_alerts_1h")
+        gap = Gap(source="itop", reason="timeout after 5s", tool="asset_context")
         verdict = run(triage_mod.single_stage_triage(make_evidence(investigation_gaps=[gap])))
 
         by_name = {s.source_name: s for s in verdict.evidence_situation.sources}
         assert by_name["rule_context"].status == "present"
 
     def test_mutation_guard_gap_source_detection_actually_matters(self, monkeypatch):
-        """Confirms the missing/present split is driven by real Gap data, not
-        a hardcoded constant — two different gap sets must produce two
-        different missing sets."""
+        """The missing/present split must be driven by actual Gap data, not
+        a fixed value — two different gap sets should produce two different
+        missing sets."""
 
         async def raising_call_llm(evidence):
             raise httpx.ConnectError("simulated")

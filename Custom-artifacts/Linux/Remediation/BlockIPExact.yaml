@@ -1,0 +1,244 @@
+name: Custom.Linux.Remediation.BlockIPExact
+description: |
+  Block a specific IP address on a Linux endpoint using iptables (nf_tables
+  backend), both inbound and outbound.
+
+  Design principles (mirrors Custom.Windows.Remediation.BlockIPExact):
+  - TargetIP is matched EXACTLY -- no regex, no shell string interpolation
+    into a command. The IP is passed as a single argv element via execve().
+  - Input is validated inside VQL before any execve() call.
+  - ReallyDoIt defaults to FALSE (dry-run): reports what would be done
+    without touching iptables.
+  - RemoveRule=TRUE deletes the rules previously created by this artifact.
+  - Velociraptor frontend connectivity is tested after apply; rules are
+    rolled back if the agent can no longer reach the server.
+  - Idempotent: uses `iptables -C` (check) before `-A` (append), so
+    re-running with the same IP does not create duplicate rules.
+  - Rules are tagged with a deterministic iptables comment
+    (--comment "<RuleName>-<TargetIP>") since iptables has no native rule
+    naming -- this comment is what RemoveRule searches for.
+
+  NO internet connection required. All logic is self-contained in VQL/execve.
+
+author: TrustShield / SOC-3s
+type: CLIENT
+required_permissions:
+  - EXECVE
+  - NETWORK
+
+precondition: SELECT OS FROM info() WHERE OS = 'linux'
+
+parameters:
+  - name: TargetIP
+    description: |
+      IPv4 address (or CIDR range) to block. Must be a plain dotted-decimal
+      value -- e.g. 1.2.3.4 or 1.2.3.0/24. Will be validated before use.
+    default: ""
+
+  - name: RuleName
+    description: |
+      Identifier embedded in the iptables comment used to tag/find rules
+      created by this artifact. Final comment: '<RuleName>-<TargetIP>'.
+    default: "VeloBlockIP"
+
+  - name: ReallyDoIt
+    description: |
+      Set to TRUE to actually modify iptables. FALSE (default) = dry-run:
+      reports what would happen without touching any rules.
+    type: bool
+    default: "N"
+
+  - name: RemoveRule
+    description: |
+      Set to TRUE to DELETE the block rules for TargetIP (rollback mode).
+      Takes precedence over ReallyDoIt when both are set.
+    type: bool
+    default: "N"
+
+sources:
+  - query: |
+      -- ── Input validation ────────────────────────────────────────────────
+      -- Accept plain IPv4 (x.x.x.x) or CIDR (x.x.x.x/nn) only.
+      -- This runs before any execve call -- nothing reaches iptables if invalid.
+      LET valid_ip = TargetIP =~ '''^(\d{1,3}\.){3}\d{1,3}(/\d{1,2})?$'''
+
+      LET validation_result = SELECT
+            timestamp(epoch=now()) AS Time,
+            if(condition= NOT valid_ip,
+               then= "INVALID: TargetIP '" + TargetIP + "' is not a valid IPv4 address or CIDR. Aborting.",
+               else= if(condition= TargetIP = "",
+                        then= "INVALID: TargetIP is empty. Aborting.",
+                        else= "OK")) AS Result
+        FROM scope()
+
+      -- Abort early if invalid
+      LET _ = SELECT *
+        FROM if(condition= NOT valid_ip OR TargetIP = "",
+                then= { SELECT log(message="VR_BlockIP (Linux): " + Result) FROM validation_result })
+
+      -- ── Comment tag used to identify our rules ───────────────────────────
+      LET Comment = RuleName + "-" + TargetIP
+
+      -- ── Helpers: extract Velociraptor frontend host/port for the
+      --    connectivity test, same approach as the Windows artifact ───────
+      LET get_domain(URL) = parse_string_with_regex(
+            string=URL,
+            regex='''^https?://(?P<Domain>[^:/]+)''').Domain
+
+      LET get_port(URL) = if(
+            condition= URL =~ "https://[^:]+/", then="443",
+            else= if(condition= URL =~ "http://[^:]+/", then="80",
+            else= parse_string_with_regex(
+                    string=URL,
+                    regex='''^https?://[^:/]+(:(?P<Port>[0-9]*))?/''').Port))
+
+      LET extracted_config <= SELECT * FROM foreach(
+            row=config.server_urls,
+            query={
+                SELECT
+                    get_domain(URL=_value) AS DstAddr,
+                    get_port(URL=_value)   AS DstPort,
+                    _value AS URL
+                FROM scope()
+            })
+
+      -- ── Check existence (idempotency) ────────────────────────────────────
+      -- iptables -C returns non-zero if the rule does not exist -- that is
+      -- expected and not an error condition here, just a presence check.
+      LET check_inbound = SELECT *
+        FROM execve(argv=['iptables', '-C', 'INPUT',
+                '-s', TargetIP, '-j', 'DROP',
+                '-m', 'comment', '--comment', Comment],
+                length=10000)
+
+      LET check_outbound = SELECT *
+        FROM execve(argv=['iptables', '-C', 'OUTPUT',
+                '-d', TargetIP, '-j', 'DROP',
+                '-m', 'comment', '--comment', Comment],
+                length=10000)
+
+      LET inbound_exists  = check_inbound[0].ReturnCode  = 0
+      LET outbound_exists = check_outbound[0].ReturnCode = 0
+
+      -- ── Add inbound block rule (only if not already present) ────────────
+      LET add_inbound = SELECT
+            timestamp(epoch=now()) AS Time,
+            "add-inbound" AS Op,
+            Stdout + Stderr AS Result,
+            ReturnCode
+        FROM execve(
+            argv=['iptables', '-A', 'INPUT',
+                  '-s', TargetIP, '-j', 'DROP',
+                  '-m', 'comment', '--comment', Comment],
+            length=10000)
+
+      -- ── Add outbound block rule (only if not already present) ───────────
+      LET add_outbound = SELECT
+            timestamp(epoch=now()) AS Time,
+            "add-outbound" AS Op,
+            Stdout + Stderr AS Result,
+            ReturnCode
+        FROM execve(
+            argv=['iptables', '-A', 'OUTPUT',
+                  '-d', TargetIP, '-j', 'DROP',
+                  '-m', 'comment', '--comment', Comment],
+            length=10000)
+
+      -- ── Delete rules by comment (idempotent, used for RemoveRule and
+      --    for rollback-on-connectivity-failure) ──────────────────────────
+      LET delete_inbound = SELECT
+            timestamp(epoch=now()) AS Time,
+            "delete-inbound" AS Op,
+            Stdout + Stderr AS Result
+        FROM execve(
+            argv=['iptables', '-D', 'INPUT',
+                  '-s', TargetIP, '-j', 'DROP',
+                  '-m', 'comment', '--comment', Comment],
+            length=10000)
+
+      LET delete_outbound = SELECT
+            timestamp(epoch=now()) AS Time,
+            "delete-outbound" AS Op,
+            Stdout + Stderr AS Result
+        FROM execve(
+            argv=['iptables', '-D', 'OUTPUT',
+                  '-d', TargetIP, '-j', 'DROP',
+                  '-m', 'comment', '--comment', Comment],
+            length=10000)
+
+      -- ── Connectivity test ─────────────────────────────────────────────────
+      LET test_connection = SELECT * FROM foreach(
+            row={ SELECT * FROM extracted_config LIMIT 1 },
+            query={
+                SELECT *, Url, Response
+                FROM http_client(
+                    url='https://' + DstAddr + ':' + DstPort + '/server.pem',
+                    disable_ssl_security='TRUE')
+                WHERE Response = 200
+                LIMIT 1
+            })
+
+      -- ── Dry-run report ────────────────────────────────────────────────────
+      LET dry_run_result = SELECT
+            timestamp(epoch=now()) AS Time,
+            "dry-run" AS Op,
+            "DRY-RUN: Would add iptables INPUT/OUTPUT DROP rules tagged '" +
+            Comment + "' to block " + TargetIP +
+            " (inbound + outbound). Set ReallyDoIt=TRUE to execute." AS Result
+        FROM scope()
+
+      -- ── Remove-complete report ────────────────────────────────────────────
+      LET remove_complete = SELECT
+            timestamp(epoch=now()) AS Time,
+            "remove-complete" AS Op,
+            "Rules tagged '" + Comment + "' deleted (or were already absent)." AS Result
+        FROM scope()
+
+      -- ── Already-present report (idempotent no-op) ────────────────────────
+      LET already_present = SELECT
+            timestamp(epoch=now()) AS Time,
+            "already-present" AS Op,
+            "Rules tagged '" + Comment + "' already exist. No changes made." AS Result
+        FROM scope()
+
+      -- ── Orchestration ─────────────────────────────────────────────────────
+      SELECT * FROM if(
+        condition= RemoveRule,
+        then={
+            SELECT * FROM chain(
+                a=delete_inbound,
+                b=delete_outbound,
+                c=remove_complete)
+        },
+        else= if(
+          condition= NOT ReallyDoIt,
+          then=dry_run_result,
+          else= if(
+            condition= inbound_exists AND outbound_exists,
+            then=already_present,
+            else={
+              SELECT * FROM chain(
+                  a={ SELECT * FROM if(condition= NOT inbound_exists,  then=add_inbound) },
+                  b={ SELECT * FROM if(condition= NOT outbound_exists, then=add_outbound) },
+                  c={ SELECT * FROM if(
+                          condition= test_connection,
+                          then={
+                              SELECT timestamp(epoch=now()) AS Time,
+                                     "connectivity-ok" AS Op,
+                                     "Connectivity test passed. Rules are active: " +
+                                     Comment AS Result
+                              FROM scope()
+                          },
+                          else={
+                              SELECT * FROM chain(
+                                  a=delete_inbound,
+                                  b=delete_outbound,
+                                  c={ SELECT timestamp(epoch=now()) AS Time,
+                                             "connectivity-fail-rollback" AS Op,
+                                             "CONNECTIVITY FAILED after applying rules. " +
+                                             "Rules rolled back to preserve Velociraptor comms." AS Result
+                                      FROM scope() })
+                          })
+                    })
+            })
+        ))

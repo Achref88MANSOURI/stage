@@ -10,8 +10,8 @@ shape below has been captured from this deployment.
 
 A green test against these fixtures proves exactly one thing: the extractor does
 not crash and maps the field paths as written. It does NOT prove the shape is
-what Security Onion actually emits. Per implementation guide §0.1, that can only
-be established once the relevant sensor or telemetry path is live.
+what Security Onion actually emits — that can only be established once the
+relevant sensor or telemetry path is live.
 
 The one REAL fixture lives in `sigma-alert-sample.json` at the repo root and
 covers `endpoint.events.process` only. It is loaded by `conftest.py`, not here.
@@ -25,13 +25,11 @@ from __future__ import annotations
 
 # ---------------------------------------------------------------------------
 # endpoint.events.file / endpoint.events.library / cross-process-access /
-# ECS related.* fixtures (ENDPOINT_FILE_ALERT, ENDPOINT_LIBRARY_ALERT,
-# TARGET_PROCESS_ALERT, RELATED_ENTITIES_ALERT) REMOVED 2026-09-07,
-# user-directed — alert_builder.py no longer structurally extracts
-# file/registry/target_process/library/related_entities at all (see
-# schemas/alert.py::CanonicalAlert's docstring); that detail now reaches the
-# single LLM call through CanonicalAlert.raw_alert directly, which needs no
-# dedicated fixture since it's just the raw_alert dict passed straight
+# ECS related.* shapes have no dedicated fixture here — alert_builder.py does
+# not structurally extract file/registry/target_process/library/related_entities
+# at all (see schemas/alert.py::CanonicalAlert's docstring); that detail
+# reaches the LLM call through CanonicalAlert.raw_alert directly, which needs
+# no dedicated fixture since it's just the raw_alert dict passed straight
 # through. See tests/test_alert_builder.py::TestRawAlertPassthrough.
 # ---------------------------------------------------------------------------
 
@@ -62,108 +60,15 @@ SYSMON_WINLOG_ALERT = {
 }
 
 # ---------------------------------------------------------------------------
-# SYNTHETIC — PowerShell engine-lifecycle (winlog sub-shape)
-# ---------------------------------------------------------------------------
-POWERSHELL_ENGINE_ALERT = {
-    "@timestamp": "2026-07-22T10:00:00Z",
-    "rule": {"name": "PowerShell Engine Started", "uuid": "ffffffff-1111-2222-3333-444444444444"},
-    "event": {"severity": 2, "module": "sigma"},
-    "event_data": {
-        "event": {"dataset": "windows.powershell_operational"},
-        "winlog": {"computer_name": "win-kvkmd51ggkq"},
-        "powershell": {
-            "engine": {"new_state": "Available", "previous_state": "None", "version": "5.1.19041.1"},
-            "process": {"executable_version": "5.1.19041.1"},
-            "runspace_id": "11111111-2222-3333-4444-555555555555",
-        },
-    },
-}
-
-# ---------------------------------------------------------------------------
-# SYNTHETIC — system.auth (Filebeat SSH auth log)
-# ---------------------------------------------------------------------------
-SSH_AUTH_ALERT = {
-    "@timestamp": "2026-07-22T10:10:00Z",
-    "rule": {"name": "SSH Login Accepted", "uuid": "00000000-1111-2222-3333-444444444444"},
-    "event": {"severity": 2, "module": "sigma"},
-    "event_data": {
-        "event": {"dataset": "system.auth"},
-        "system": {"auth": {"ssh": {"event": "Accepted", "method": "publickey"}}},
-        "source": {"ip": "10.20.30.40", "port": 51234},
-        "user": {"name": "root"},
-    },
-}
-
-# ---------------------------------------------------------------------------
-# SYNTHETIC — windows.sysmon_operational network_connection event (gap #5).
-# No real Sysmon network_connection alert has been captured in this
-# deployment yet — field path (event_data.network.community_id) taken from
-# so-analysis/elasticsearch templates (tier 3), not a live document.
-# ---------------------------------------------------------------------------
-SSH_AUTH_ALERT_WITH_COMMUNITY_ID = {
-    "@timestamp": "2026-07-22T10:10:00Z",
-    "rule": {"name": "SSH Login Accepted", "uuid": "00000000-1111-2222-3333-444444444444"},
-    "event": {"severity": 2, "module": "sigma"},
-    "event_data": {
-        "event": {"dataset": "system.auth"},
-        "system": {"auth": {"ssh": {"event": "Accepted", "method": "publickey"}}},
-        "source": {"ip": "10.20.30.40", "port": 51234},
-        "user": {"name": "root"},
-        "network": {"community_id": "1:synthetic-community-id-hash="},
-    },
-}
-
-# ---------------------------------------------------------------------------
-# SYNTHETIC — kratos.audit (HTTP identity-provider login flow)
-# ---------------------------------------------------------------------------
-KRATOS_LOGIN_FLOW_ALERT = {
-    "@timestamp": "2026-07-22T10:20:00Z",
-    "rule": {"name": "Repeated Failed Login Flow", "uuid": "99999999-1111-2222-3333-444444444444"},
-    "event": {"severity": 3, "module": "sigma"},
-    "event_data": {
-        "event": {"dataset": "kratos.audit"},
-        "http": {
-            "method": "POST",
-            "uri": "/self-service/login",
-            "useragent": "Mozilla/5.0",
-            "request": {"remote": "203.0.113.9:44321"},
-        },
-        "login_flow": {"type": "browser", "state": "choose_method", "active": "password"},
-    },
-}
-
-# ---------------------------------------------------------------------------
-# SYNTHETIC — Suricata network alert.
-# A REAL Suricata alert fixture now exists (`tests/fixtures/
-# suricata-alert-real.json`, `real_suricata_alert_source` in conftest.py) —
-# see TestRealSuricataPath for the parts that fixture covers. This synthetic
-# fixture remains for the parts it doesn't: a different rule/uuid (breadth
-# across more than one Suricata rule), an IPv6 destination, and
-# `network.initiated` — a field the live index mapping (ingest-templates.txt)
-# confirms CAN appear on a Suricata alert, just not one the one real sample
-# happens to have populated. `transport` was corrected 2026-08-18 to match
-# real data: `"TCP"` (uppercase), not `"tcp"`.
-# ---------------------------------------------------------------------------
-SURICATA_ALERT = {
-    "@timestamp": "2026-07-22T10:30:00Z",
-    "rule": {"name": "ET MALWARE Observed DNS Query", "uuid": "2027001"},
-    "event": {"severity": 4, "module": "suricata", "severity_label": "high"},
-    "source": {"ip": "172.20.24.99", "port": 51515},
-    "destination": {"ip": "185.53.178.50", "port": 443, "ipv6": None},
-    "network": {"transport": "TCP", "initiated": True},
-}
-
-# ---------------------------------------------------------------------------
 # SYNTHETIC — YARA/Strelka file alert.
 # NOTE: YARA path — unit-tested against synthetic fixture only, no live SO alert
-# exists yet to validate against (implementation guide §0.1). Hashes sit at a
-# TOP-LEVEL `hash` sibling of `file`, not nested under it — per Security Onion's
-# own strelka.file ingest pipeline in so-alert-reference/.
+# exists yet to validate against. Hashes sit at a TOP-LEVEL `hash` sibling of
+# `file`, not nested under it — per Security Onion's own strelka.file ingest
+# pipeline in so-alert-reference/.
 #
-# entropy/pe_image_version/pe_flags/timestamps/mode/ssdeep (added 2026-08-19,
-# gap #7) are ALSO synthetic — field paths from so-analysis/elasticsearch
-# templates (TEMPLATE-SCHEMA-REFERENCE.md §5), not a live document. The
-# Strelka sensor isn't enabled in this deployment (gap #13), so no real
+# entropy/pe_image_version/pe_flags/timestamps/mode/ssdeep are ALSO synthetic
+# — field paths from so-analysis/elasticsearch templates, not a live
+# document. The Strelka sensor isn't enabled in this deployment, so no real
 # alert of this shape can exist yet to validate against.
 # ---------------------------------------------------------------------------
 YARA_STRELKA_ALERT = {

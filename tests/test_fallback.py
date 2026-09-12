@@ -1,18 +1,17 @@
-"""`nodes/triage.py::_stage_fallback` — v6 single-call redesign (SOC-3s v6
-spec §7, 2026-09-06). The single merged fallback replacing the deleted
-`nodes/context.py::_stage_3_fallback` and `nodes/analyze.py::_stage_4_fallback`.
-Never fabricates a verdict; always escalates to human review on failure.
+"""Tests for `stages/triage.py::_stage_fallback`, the deterministic fallback
+used when the triage LLM call fails. It never fabricates a verdict and
+always escalates to human review.
 
-`evidence_situation`-shape coverage (missing-vs-present per source) lives in
-`tests/test_evidence_situation.py::TestStageFallbackBuildsEvidenceSituation`
-— this file covers the rest of the fallback's fixed output.
+`evidence_situation` coverage lives separately in
+`tests/test_evidence_situation.py`; this file covers the rest of the
+fallback's fixed output.
 """
 
 from __future__ import annotations
 
 from datetime import datetime, timezone
 
-from nodes import triage as triage_mod
+from stages import triage as triage_mod
 from schemas import CanonicalAlert, RawEvidence, RuleContext, Rule, ShallowCase
 
 
@@ -48,12 +47,11 @@ class TestFallbackNeverFabricatesAVerdict:
 
 
 class TestFallbackPriorityIsP2NotP3:
-    """v6 spec §7's explicit choice, carried over from the old Stage 4
-    fallback's rationale (newdesign.md §4): a failed pipeline cannot safely
-    be treated as low-risk, and P2 guarantees the alert reaches an analyst
-    this shift — a stricter floor than the "low reliability -> minimum P3"
-    rule the LLM path itself follows, because here there's no verdict at
-    all, not just a low-confidence one."""
+    """A failed pipeline cannot safely be treated as low-risk, so P2
+    guarantees the alert reaches an analyst this shift — a stricter floor
+    than the "low reliability -> minimum P3" rule the LLM path itself
+    follows, because here there's no verdict at all, not just a
+    low-confidence one."""
 
     def test_priority_band_is_p2(self):
         result = triage_mod._stage_fallback(make_evidence())
@@ -74,8 +72,8 @@ class TestFallbackSafetyGateAlwaysApplied:
 
 
 class TestFallbackPreservesMitreMapping:
-    """Does NOT return an empty list — the v3 "silent severity cap" bug,
-    architecture §8's own named warning, carried over unchanged."""
+    """Does NOT return an empty list — a downed LLM must not silently drop
+    MITRE grounding the rule context already established."""
 
     def test_mitre_attack_from_rule_context_is_preserved(self):
         evidence = make_evidence(

@@ -1,0 +1,242 @@
+name: Custom.Windows.Remediation.BlockIPExact
+description: |
+  Block a specific IP address on a Windows endpoint using Windows Firewall
+  (netsh advfirewall), both inbound and outbound.
+
+  Design principles (same as Custom.Windows.Remediation.KillProcessExact):
+  - TargetIP is matched EXACTLY — no regex, no string interpolation into a
+    shell command. The IP is passed as a single argv element.
+  - Input is validated inside VQL before any execve() call.
+  - ReallyDoIt defaults to FALSE (dry-run): reports what would be done
+    without touching the firewall.
+  - RemoveRule=TRUE deletes the rules previously created by this artifact.
+  - Velociraptor frontend connectivity is tested after apply; rules are
+    rolled back if the agent can no longer reach the server.
+  - Idempotent: deletes any existing same-named rules before creating new
+    ones, so re-running with the same IP is safe.
+  - Rule names are deterministic: <RuleName>-in-<IP> and <RuleName>-out-<IP>
+    for easy identification and targeted removal.
+
+  NO internet connection required. All logic is self-contained in VQL/execve.
+
+author: TrustShield / SOC-3s
+
+type: CLIENT
+
+required_permissions:
+  - EXECVE
+  - NETWORK
+
+precondition: SELECT OS From info() where OS = 'windows'
+
+parameters:
+  - name: TargetIP
+    description: |
+      IPv4 address (or CIDR range) to block. Must be a plain dotted-decimal
+      value — e.g. 1.2.3.4 or 1.2.3.0/24. Will be validated before use.
+    default: ""
+
+  - name: RuleName
+    description: |
+      Prefix for the firewall rule names. Final names will be
+      '<RuleName>-in-<TargetIP>' and '<RuleName>-out-<TargetIP>'.
+    default: "VeloBlockIP"
+
+  - name: ReallyDoIt
+    description: |
+      Set to TRUE to actually modify the firewall. FALSE (default) = dry-run:
+      reports what would happen without touching any firewall rules.
+    type: bool
+    default: "N"
+
+  - name: RemoveRule
+    description: |
+      Set to TRUE to DELETE the block rules for TargetIP (rollback mode).
+      Takes precedence over ReallyDoIt when both are set.
+    type: bool
+    default: "N"
+
+sources:
+  - query: |
+      -- ── Input validation ────────────────────────────────────────────────
+      -- Accept plain IPv4 (x.x.x.x) or CIDR (x.x.x.x/nn) only.
+      -- This runs before any execve call — nothing reaches netsh if invalid.
+      LET valid_ip = TargetIP =~ '''^(\d{1,3}\.){3}\d{1,3}(/\d{1,2})?$'''
+
+      LET validation_result = SELECT
+            timestamp(epoch=now()) AS Time,
+            if(condition= NOT valid_ip,
+               then= "INVALID: TargetIP '" + TargetIP + "' is not a valid IPv4 address or CIDR. Aborting.",
+               else= if(condition= TargetIP = "",
+                        then= "INVALID: TargetIP is empty. Aborting.",
+                        else= "OK")) AS Result
+        FROM scope()
+
+      -- Abort early if invalid
+      LET _ = SELECT *
+        FROM if(condition= NOT valid_ip OR TargetIP = "",
+                then= { SELECT log(message="VR_BlockIP: " + Result) FROM validation_result })
+
+      -- ── Rule name components ─────────────────────────────────────────────
+      LET InRuleName  = RuleName + "-in-"  + TargetIP
+      LET OutRuleName = RuleName + "-out-" + TargetIP
+
+      -- ── Helpers ──────────────────────────────────────────────────────────
+      -- Parse Velociraptor server URL to test connectivity after apply
+      LET get_domain(URL) = parse_string_with_regex(
+            string=URL,
+            regex='''^https?://(?P<Domain>[^:/]+)''').Domain
+
+      LET get_port(URL) = if(
+            condition= URL =~ "https://[^:]+/", then="443",
+            else= if(condition= URL =~ "http://[^:]+/", then="80",
+            else= parse_string_with_regex(
+                    string=URL,
+                    regex='''^https?://[^:/]+(:(?P<Port>[0-9]*))?/''').Port))
+
+      LET extracted_config <= SELECT * FROM foreach(
+            row=config.server_urls,
+            query={
+                SELECT
+                    get_domain(URL=_value) AS DstAddr,
+                    get_port(URL=_value)   AS DstPort,
+                    _value AS URL
+                FROM scope()
+            })
+
+      -- ── Delete existing rules (used for both rollback and idempotent add) ─
+      LET delete_rules = SELECT
+            timestamp(epoch=now()) AS Time,
+            "delete" AS Op,
+            Stdout + Stderr AS Result
+        FROM chain(
+            a={ SELECT * FROM execve(argv=['netsh','advfirewall','firewall',
+                    'delete','rule', format(format='name=%v', args=InRuleName)],
+                    length=10000) },
+            b={ SELECT * FROM execve(argv=['netsh','advfirewall','firewall',
+                    'delete','rule', format(format='name=%v', args=OutRuleName)],
+                    length=10000) })
+
+      -- ── Add inbound block rule ────────────────────────────────────────────
+      LET add_inbound = SELECT
+            timestamp(epoch=now()) AS Time,
+            "add-inbound" AS Op,
+            Stdout + Stderr AS Result,
+            ReturnCode
+        FROM execve(
+            argv=['netsh','advfirewall','firewall','add','rule',
+                  format(format='name=%v',     args=InRuleName),
+                  'dir=in',
+                  'action=block',
+                  format(format='remoteip=%v', args=TargetIP),
+                  'protocol=any',
+                  'enable=yes'],
+            length=10000)
+
+      -- ── Add outbound block rule ───────────────────────────────────────────
+      LET add_outbound = SELECT
+            timestamp(epoch=now()) AS Time,
+            "add-outbound" AS Op,
+            Stdout + Stderr AS Result,
+            ReturnCode
+        FROM execve(
+            argv=['netsh','advfirewall','firewall','add','rule',
+                  format(format='name=%v',     args=OutRuleName),
+                  'dir=out',
+                  'action=block',
+                  format(format='remoteip=%v', args=TargetIP),
+                  'protocol=any',
+                  'enable=yes'],
+            length=10000)
+
+      -- ── Connectivity test ─────────────────────────────────────────────────
+      LET test_connection = SELECT * FROM foreach(
+            row={ SELECT * FROM extracted_config LIMIT 1 },
+            query={
+                SELECT *,
+                    Url,
+                    Response
+                FROM http_client(
+                    url='https://' + DstAddr + ':' + DstPort + '/server.pem',
+                    disable_ssl_security='TRUE')
+                WHERE Response = 200
+                LIMIT 1
+            })
+
+      -- ── Rollback: remove inbound rule that was just added ─────────────────
+      LET rollback_inbound = SELECT
+            timestamp(epoch=now()) AS Time,
+            "rollback-inbound" AS Op,
+            Stdout + Stderr AS Result
+        FROM execve(
+            argv=['netsh','advfirewall','firewall',
+                  'delete','rule',
+                  format(format='name=%v', args=InRuleName)],
+            length=10000)
+
+      -- ── Dry-run report ────────────────────────────────────────────────────
+      LET dry_run_result = SELECT
+            timestamp(epoch=now()) AS Time,
+            "dry-run" AS Op,
+            "DRY-RUN: Would create rules '" + InRuleName + "' and '" +
+            OutRuleName + "' to block " + TargetIP +
+            " (inbound + outbound). Set ReallyDoIt=TRUE to execute." AS Result
+        FROM scope()
+
+      -- ── Orchestration ─────────────────────────────────────────────────────
+      SELECT * FROM if(
+        -- RemoveRule mode: just delete and return
+        condition= RemoveRule,
+        then={
+            SELECT * FROM chain(
+                a=delete_rules,
+                b={ SELECT timestamp(epoch=now()) AS Time, "remove-complete" AS Op,
+                           "Rules for " + TargetIP + " deleted (or were already absent)." AS Result
+                    FROM scope() })
+        },
+        else= if(
+          -- Dry-run mode
+          condition= NOT ReallyDoIt,
+          then=dry_run_result,
+          -- Execute mode
+          else={
+            SELECT * FROM chain(
+                -- Step 1: delete any existing same-named rules (idempotent)
+                a=delete_rules,
+
+                -- Step 2: add inbound rule
+                b={ SELECT * FROM if(condition= valid_ip, then=add_inbound) },
+
+                -- Step 3: add outbound rule (only if inbound succeeded)
+                c={ SELECT * FROM foreach(
+                        row={ SELECT * FROM add_inbound WHERE ReturnCode = 0 LIMIT 1 },
+                        query=add_outbound) },
+
+                -- Step 4: test Velociraptor connectivity
+                d={ SELECT * FROM if(
+                        condition= test_connection,
+                        then={
+                            SELECT timestamp(epoch=now()) AS Time,
+                                   "connectivity-ok" AS Op,
+                                   "Connectivity test passed. Rules are active: " +
+                                   InRuleName + " / " + OutRuleName AS Result
+                            FROM scope()
+                        },
+                        else={
+                            -- Lost connectivity — roll back inbound rule
+                            -- (outbound not yet added if we're here, or add both rollbacks)
+                            SELECT * FROM chain(
+                                a=rollback_inbound,
+                                b={ SELECT * FROM execve(
+                                        argv=['netsh','advfirewall','firewall',
+                                              'delete','rule',
+                                              format(format='name=%v', args=OutRuleName)],
+                                        length=10000) },
+                                c={ SELECT timestamp(epoch=now()) AS Time,
+                                           "connectivity-fail-rollback" AS Op,
+                                           "CONNECTIVITY FAILED after applying rules. " +
+                                           "Rules rolled back to preserve Velociraptor comms." AS Result
+                                    FROM scope() })
+                        })
+                })
+          }))

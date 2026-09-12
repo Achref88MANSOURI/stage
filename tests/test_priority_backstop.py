@@ -1,20 +1,19 @@
-"""`nodes/triage.py::_apply_safety_backstop` — v5 redesign (`newdesign.md`
-§4). Deterministic safety gate applied after the LLM output is parsed: if
-evidence reliability is "low" and the LLM assigned P4/P5 anyway, escalate
-one band. Belt-and-suspenders behind the identical prompt instruction in
-`prompts/triage_agent.py`'s `== EVIDENCE SITUATION ==` section — this test
-file exercises the deterministic code path directly, bypassing the LLM
-entirely, the same way `tests/test_triage.py::TestMergeTargetValidation`
+"""Tests for `stages/triage.py::_apply_safety_backstop` — a deterministic
+safety gate applied after the LLM output is parsed: if evidence reliability
+is "low" and the LLM assigned P4/P5 anyway, escalate one band. This backs up
+the equivalent prompt instruction in `prompts/triage_agent.py`'s
+`== EVIDENCE SITUATION ==` section by exercising the deterministic code path
+directly, the same way `tests/test_triage.py::TestMergeTargetValidation`
 proves `_validate_merge_target` holds independently of schema enforcement.
 
-**v6 redesign (2026-09-06)**: `_apply_safety_backstop(verdict)` takes ONE
-argument now, not `(verdict, context)` — `evidence_situation` lives directly
-on `TriageVerdict`, read off the same object `priority_band` comes from.
+`_apply_safety_backstop(verdict)` takes one argument: `evidence_situation`
+lives directly on `TriageVerdict`, read off the same object `priority_band`
+comes from.
 """
 
 from __future__ import annotations
 
-from nodes import triage as triage_mod
+from stages import triage as triage_mod
 from schemas import CorrelationDecision, EvidenceSituation, TriageVerdict
 
 

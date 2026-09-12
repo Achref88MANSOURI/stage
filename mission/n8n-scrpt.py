@@ -3,47 +3,37 @@ Build a COMPLETE TheHive 5 "create alert" request body -- metadata AND
 observables -- from a raw SOC alert of ANY shape (Sigma / YARA / Suricata
 via Security Onion -> n8n). One node, one POST.
 
-This merges what used to be two separate Code nodes:
-  - IOC extraction (walks the whole alert tree, validates every candidate
-    with ipaddress/urlparse, filters infrastructure noise)
-  - Alert metadata resolution (engine/severity/rule/time/sourceRef)
+Does IOC extraction (walks the whole alert tree, validates every candidate
+with ipaddress/urlparse, filters infrastructure noise) and alert metadata
+resolution (engine/severity/rule/time/sourceRef) together.
 
-SOC-3s deployment decision, 2026-09-06 -- SCOPE NARROWED: this script's
-mission for Sigma/YARA is now IOC-only, not general incident-response
-tooling data. Observables are exactly:
+For Sigma/YARA, observables are exactly:
   - `ioc: true` threat-intel observables -- external IPs, domains, URLs,
     file hashes (dataTypes ip/domain/url/hash) -- fit to check against a
     reputation feed;
   - a minimal `ioc: false` source-of-alert pair -- `hostname` and
     `endpoint-ip` (the alert's own host/endpoint identity, not a threat
     indicator) -- and nothing else.
-Process identity (path/pid/entity-id), host-id, registry, file-path, and
-autonomous-system observables are DELIBERATELY NOT extracted any more --
-they were built in earlier sessions (see git history) for a broader
-incident-response-tooling mission this script no longer has. Suricata is
-unaffected (normalize_suricata_alert already only ever extracted its own
-IOC-shaped set: ip/port/community-id/sid/dns-content-match).
+Process identity (path/pid/entity-id), host-id, registry, and file-path
+observables are NOT extracted -- this script's mission is IOC-only, not
+general incident-response tooling data. Suricata's own normalizer
+(`normalize_suricata_alert`) extracts its own IOC-shaped set independently:
+ip/port/community-id/sid/dns-content-match.
 
 Every hash observable that can be traced to a specific process or file
-gets a `process:<name>` or `file:<name>` tag naming that owner -- per
-this deployment's own "the hash must be determined from what it came
-from" requirement. See `_extract_hash_owners` for the two real,
-structurally different shapes this covers (Sigma's process-nested hash,
-YARA/Strelka's
-file-sibling hash).
+gets a `process:<name>` or `file:<name>` tag naming that owner. See
+`_extract_hash_owners` for the two real, structurally different shapes
+this covers (Sigma's process-nested hash, YARA/Strelka's file-sibling
+hash).
 
 Custom TheHive observable dataType used by this deployment (must exist as
 a custom observable type in TheHive's admin config, alongside the stock
 ones): `endpoint-ip` (our own asset's IP -- host.ip for Sigma/YARA, the
 internal side of a Suricata flow -- distinct from the `ip` dataType, which
-is always the threat-intel external side). `host-id`/`process-path`/
-`process-pid`/`process-entity-id` are retired custom dataTypes (2026-09-06,
-see above) -- if they were registered in TheHive's admin config for a
-prior version of this script, they're simply unused now, not invalid.
+is always the threat-intel external side).
 
-The alert body carries no `tags` field (removed 2026-09-04) for Sigma/
-YARA, and no observable is ever reported under the generic `other`
-dataType for either engine.
+The alert body carries no `tags` field for Sigma/YARA, and no observable
+is ever reported under the generic `other` dataType for either engine.
 
 Threat-intel observables (external IPs, domains, URLs, hashes) are
 additionally checked against a curated allowlist of well-known LEGITIMATE
@@ -56,22 +46,21 @@ reputation lookup -- deeper vetting (VirusTotal/OpenCTI/Cortex) happens
 downstream in the real SOC-3s pipeline.
 
 Field coverage is grounded in `so-alert-reference/ingest/*` (Security
-Onion's own ingest pipeline definitions) plus live-captured real alerts --
-see inline comments for what's confirmed vs. defensive. Windows/Sysmon
+Onion's own ingest pipeline definitions) plus real captured alerts -- see
+inline comments for what's confirmed vs. defensive. Windows/Sysmon
 endpoint categories (process_creation, file_event, registry_*, etc.) and
 Suricata/Zeek-shaped network alerts are covered by dedicated field
 extraction. Cloud/identity/proxy sources this deployment also runs Sigma
 rules against (Azure AD, AWS CloudTrail, GCP, Okta, M365, PaloAlto,
-generic webserver/proxy logs -- confirmed live in so-detection, 2026-08-18)
-are deliberately NOT given dedicated field mappings: none of their schemas
-exist in so-alert-reference or any real captured fixture in this repo, and
-guessing field names for a schema never verified against real data is
-exactly what this project's fixture discipline prohibits. They still get
-whatever the schema-agnostic IOC scanner below can find generically
-(IPs/domains/URLs/hashes anywhere in the tree) -- just not a targeted
-response-observable extraction. Extend `resolve_response_observables` for
-one of these the same way the others were built: real captured alert
-first, then code.
+generic webserver/proxy logs) are deliberately NOT given dedicated field
+mappings: none of their schemas exist in so-alert-reference or any real
+captured fixture in this repo, and guessing field names for a schema never
+verified against real data is exactly what this project's fixture
+discipline prohibits. They still get whatever the schema-agnostic IOC
+scanner below can find generically (IPs/domains/URLs/hashes anywhere in
+the tree) -- just not a targeted response-observable extraction. Extend
+`resolve_response_observables` for one of these the same way the others
+were built: real captured alert first, then code.
 
 Output shape (TheHive 5, POST /api/v1/alert):
 {
@@ -109,23 +98,19 @@ SHA1_RE   = re.compile(r'\b[a-fA-F0-9]{40}\b')
 MD5_RE    = re.compile(r'\b[a-fA-F0-9]{32}\b')
 
 # ==================================================================
-# Structural (namespace-level) infrastructure exclusion -- 2026-09-04.
+# Structural (namespace-level) infrastructure exclusion.
 #
-# BEFORE this, every fix here was the same shape: a real alert produces
-# one specific fake domain/hash from one specific leaf field
-# (`metadata.stream_id`, `event.dataset`, `dns.query_name`, ...), the
-# leaf gets added to a substring denylist, and the next never-yet-seen
-# leaf under the same plumbing namespace repeats the cycle. Confirmed
-# live the same day this comment was written: `rule.name` (never on
-# that list) produced a fake `backdoor.http.gorat` domain from the rule
-# title "...Backdoor.HTTP.GORAT..." on a real GORAT alert -- proving
-# the list was still incomplete no matter how many leaves had already
-# been added to it one at a time.
+# A leaf-by-leaf denylist (adding one specific fake domain/hash source
+# field at a time -- `metadata.stream_id`, `event.dataset`,
+# `dns.query_name`, ...) is a losing strategy: it only ever catches the
+# leaf that has already misfired once. `rule.name` is a clean example --
+# the rule title "...Backdoor.HTTP.GORAT..." on a real GORAT alert
+# produces a fake `backdoor.http.gorat` domain if that field is scanned.
 #
-# Fix, grounded in a live field-mapping census taken the same day
-# across FOUR real Elasticsearch indices spanning both alert shapes
-# this deployment produces and the underlying event-log shapes they
-# embed:
+# The fix instead excludes whole NAMESPACES, grounded in a field-mapping
+# census across the four real Elasticsearch indices spanning both alert
+# shapes this deployment produces and the underlying event-log shapes
+# they embed:
 #   - logs-detections.alerts-so*          (Sigma alert doc)
 #   - logs-suricata.alerts-so*             (Suricata alert doc)
 #   - logs-windows.sysmon_operational-*    (Sysmon event_data source)
@@ -140,9 +125,9 @@ MD5_RE    = re.compile(r'\b[a-fA-F0-9]{32}\b')
 # Sysmon index. None of these ever carry attacker-controlled content
 # on any engine this deployment runs -- they are the rule/pipeline's
 # own identity and bookkeeping, not something observed in traffic.
-# Excluding them as whole NAMESPACES, rather than chasing individual
-# leaked leaves, closes the entire class of bug this file kept hitting
-# instead of the next instance of it.
+# Excluding them as whole namespaces, rather than chasing individual
+# leaked leaves, closes the entire class of bug rather than one
+# instance of it at a time.
 #
 # `message` gets the same namespace-style treatment but keyed on FIELD
 # NAME rather than path, because every mapping above independently
@@ -165,15 +150,12 @@ INFRASTRUCTURE_NAMESPACES = {
     'source_system', '@version', '_id', '_index', '_score',
 }
 
-# `rule` was previously carved back open for its `rule.rule` leaf (Suricata
-# rule SYNTAX -- content:"..." clauses were a real IOC source, see git
-# history) -- removed 2026-09-05. Suricata alerts no longer reach this
-# blind scanner at all (see normalize_suricata_alert, which reads
-# `dns.query_name` -- the pipeline's own already-dissected copy of that
-# same content clause -- directly instead), so the whole `rule` namespace
-# excludes cleanly with no carve-out needed for the engines that still
-# use this pipeline (Sigma/YARA never populate `rule.rule` with inline
-# Suricata syntax).
+# The `rule` namespace excludes cleanly with no carve-out: Suricata
+# alerts never reach this blind scanner at all (see
+# normalize_suricata_alert, which reads `dns.query_name` -- the
+# pipeline's own already-dissected copy of the rule's content clause --
+# directly instead), and Sigma/YARA never populate `rule.rule` with
+# inline Suricata syntax.
 
 # Residual leaf/path-specific exclusions that do NOT belong to any of the
 # namespaces above -- each lives under an otherwise genuinely useful
@@ -183,23 +165,20 @@ INFRASTRUCTURE_NAMESPACES = {
 EXCLUDE_PATH_SUBSTRINGS = [
     'policy.applied.artifacts',
     # `destination.as.network` / `source.as.network` is an ASN CIDR range
-    # (e.g. "54.36.0.0/14", verified live 2026-08-17), not a host IP -- the
-    # IP regex has no CIDR awareness and was extracting the network address
-    # as a fake single-host external-IP observable.
+    # (e.g. "54.36.0.0/14"), not a host IP -- the IP regex has no CIDR
+    # awareness and would otherwise extract the network address as a fake
+    # single-host external-IP observable.
     '.as.network',
     # `network.data.decoded`/`network.data.packet` -- the decoded/raw
-    # packet payload. Live-verified 2026-09-05 against the REAL captured
-    # tests/fixtures/suricata-alert-real.json: network.data.decoded is a
-    # raw C2-session directory listing containing "initrd.img" and
-    # "nohup.out", both reported as fake ioc:true domains -- arbitrary
-    # uninterpreted payload text, not structured indicator data.
+    # packet payload: arbitrary uninterpreted payload text (e.g. a raw
+    # C2-session directory listing), not structured indicator data, so
+    # scanning it produces fake domain/hash matches from binary noise.
     # `network.community_id`/`network.transport`/etc. stay scannable.
     'network.data',
-    # `dns.query_name` -- per this repo's own CLAUDE.md, a confirmed
-    # Suricata pipeline dissect BUG: it duplicates the firing rule's own
-    # `content:"..."` match bytes rather than carrying a real DNS query,
-    # so it can never independently corroborate anything. Excluded on
-    # that documented-untrustworthy basis. `dns.question.*`/
+    # `dns.query_name` is a Suricata pipeline dissect artifact: it
+    # duplicates the firing rule's own `content:"..."` match bytes rather
+    # than carrying a real DNS query, so it can never independently
+    # corroborate anything. Excluded on that basis. `dns.question.*`/
     # `dns.answers.*` are real ECS DNS fields and stay scannable.
     'dns.query_name',
 ]
@@ -211,18 +190,16 @@ def _is_excluded_path(path):
 
     Checks EVERY dot-segment of the path against INFRASTRUCTURE_NAMESPACES,
     not just the first -- required because a Sigma alert doc embeds a full
-    nested copy of the underlying raw event under `event_data.*` (confirmed
-    live against the real logs-detections.alerts-so* mapping), WITH ITS OWN
-    copy of `data_stream`, `tags`, `event`, `metadata`, `ecs`, `agent`,
+    nested copy of the underlying raw event under `event_data.*`, WITH ITS
+    OWN copy of `data_stream`, `tags`, `event`, `metadata`, `ecs`, `agent`,
     `group`, etc. one level deeper. A first-segment-only check misses that
-    second copy entirely -- live-caught the same day this was built:
-    "endpoint.events.process"/"events.process"/the raw index name all still
-    came through as fake domains from event_data.data_stream.dataset /
-    event_data.tags / a re-embedded _index, from the REAL captured
-    sigma-alert-sample.json, even after the top-level namespace exclusion
-    above was already in place. These reserved ECS field-group names are
-    never legitimately reused as a nested key for unrelated content at any
-    depth, so an any-segment check is safe, not just convenient.
+    second copy entirely: "endpoint.events.process"/"events.process"/the
+    raw index name would otherwise come through as fake domains from
+    event_data.data_stream.dataset / event_data.tags / a re-embedded
+    _index, even with the top-level namespace exclusion in place. These
+    reserved ECS field-group names are never legitimately reused as a
+    nested key for unrelated content at any depth, so an any-segment check
+    is safe, not just convenient.
 
     Namespace check first (structural), then the small residual substring
     list for leaves that don't belong to a whole excluded namespace."""
@@ -236,22 +213,21 @@ def _is_excluded_path(path):
 
 # Deliberately NOT a TLD allowlist (see add_domain_if_valid) -- a small,
 # CLOSED set of Windows executable/script extensions that are never real
-# gTLDs/ccTLDs, used only to reject the specific false-positive pattern
-# live-verified 2026-08-18 (command-line text like
-# "...Temp\xordump.exe" producing a fake "xordump.exe" domain). Excludes
-# ambiguous ones on purpose: "com" is a real, huge gTLD (and the historical
-# DOS-executable extension is effectively extinct), so it is NOT in this
-# set -- dropping real .com domains would be a far worse regression than
-# occasionally missing a *.com executable reference.
+# gTLDs/ccTLDs, used only to reject the false-positive pattern where
+# command-line text like "...Temp\xordump.exe" produces a fake
+# "xordump.exe" domain. Excludes ambiguous ones on purpose: "com" is a
+# real, huge gTLD (and the historical DOS-executable extension is
+# effectively extinct), so it is NOT in this set -- dropping real .com
+# domains would be a far worse regression than occasionally missing a
+# *.com executable reference.
 _NON_DOMAIN_EXECUTABLE_SUFFIXES = {
     'exe', 'dll', 'sys', 'bat', 'cmd', 'ps1', 'vbs', 'vbe', 'msi', 'scr',
     'cpl', 'msc', 'jar', 'wsf', 'wsh',
-    # `pdb` -- live-verified 2026-09-05 against a REAL logs-strelka-so*
-    # doc: scan.pe.debug.pdb ("MpSigStub.pdb", the PE debug symbol path
-    # every non-stripped Windows binary carries) was coming through as a
-    # fake `mpsigstub.pdb` domain, ioc:true -- a near-100%-of-alerts false
-    # positive for the YARA/Strelka engine specifically, since almost
-    # every scanned PE has a .pdb debug path.
+    # `pdb` -- Strelka's scan.pe.debug.pdb (the PE debug symbol path every
+    # non-stripped Windows binary carries, e.g. "MpSigStub.pdb") would
+    # otherwise come through as a fake `mpsigstub.pdb` domain, ioc:true --
+    # a near-100%-of-alerts false positive for the YARA/Strelka engine
+    # specifically, since almost every scanned PE has a .pdb debug path.
     'pdb',
 }
 
@@ -358,20 +334,17 @@ def classify_ip(candidate):
 
 
 def add_domain_if_valid(candidate, domains_set):
-    """No hardcoded TLD allowlist -- deliberately removed. A fixed list of
-    ~150 TLDs was silently DROPPING real, currently-active malicious
-    domains: live-verified 2026-08-18 against this deployment's actual
-    ruleset (so-detection), real ET rules alert on Lumma Stealer C2 domains
-    on .lat/.cyou/.shop TLDs -- .lat was not in the old list, so that exact
-    domain would never have become an observable. There are 1000+ real
-    gTLDs/ccTLDs today and the list can only ever go stale; validating
-    structure (label syntax/length, alphabetic TLD shape, not a bare IP)
-    instead of TLD membership is the only way to not silently miss
-    whatever TLD a malicious domain happens to be registered on.
-    Trade-off: this is looser than a curated list, so it will occasionally
-    flag a non-domain, TLD-shaped token from free text (e.g. a file
-    extension). Acceptable here because the input is structured detection-
-    engine field values, not free-flowing prose."""
+    """No hardcoded TLD allowlist. There are 1000+ real gTLDs/ccTLDs today
+    (real ET rules in this deployment's actual ruleset alert on Lumma
+    Stealer C2 domains under .lat/.cyou/.shop, for example) and a fixed
+    TLD list can only ever go stale and silently drop a real, currently-
+    active malicious domain. Validating structure (label syntax/length,
+    alphabetic TLD shape, not a bare IP) instead of TLD membership is the
+    only way to not silently miss whatever TLD a malicious domain happens
+    to be registered on. Trade-off: this is looser than a curated list, so
+    it will occasionally flag a non-domain, TLD-shaped token from free
+    text (e.g. a file extension). Acceptable here because the input is
+    structured detection-engine field values, not free-flowing prose."""
     candidate = candidate.strip().strip('.').lower()
     if not candidate or '.' not in candidate or len(candidate) > 253:
         return
@@ -387,13 +360,13 @@ def add_domain_if_valid(candidate, domains_set):
     domains_set.add(candidate)
 
 
-# SOC-3s deployment decision, 2026-09-04: "verify it's an IOC, not
-# legitimate infrastructure" -- before this, EVERY domain/URL the regex
-# scanner found got reported ioc:true, including near-universal
-# Windows-telemetry / update / CRL-OCSP / NTP / major-CDN traffic that
-# shows up incidentally on a large share of real EDR and NIDS alerts and
-# is not attacker-controlled. This is a curated, suffix-matched allowlist
-# of well-known LEGITIMATE infrastructure -- the offline complement to
+# Every domain/URL the regex scanner finds needs a "is this an IOC, or
+# legitimate infrastructure" check before being reported ioc:true --
+# without it, near-universal Windows-telemetry / update / CRL-OCSP / NTP /
+# major-CDN traffic (which shows up incidentally on a large share of real
+# EDR and NIDS alerts and is not attacker-controlled) would be reported as
+# a threat indicator. This is a curated, suffix-matched allowlist of
+# well-known LEGITIMATE infrastructure -- the offline complement to
 # `_NON_DOMAIN_EXECUTABLE_SUFFIXES` above (that one rejects false
 # domain-shaped tokens; this one downgrades real domains that are
 # genuinely not indicators). It is NOT a live reputation lookup (no
@@ -456,15 +429,14 @@ def clean_url(raw_url):
 
 
 def normalize_ip_list(raw):
-    """Validates syntax AND drops loopback/link-local addresses -- live-
-    verified 2026-09-05 against a REAL logs-detections.alerts-so* doc:
+    """Validates syntax AND drops loopback/link-local addresses.
     event_data.host.ip is a LIST on real Elastic Endpoint data (every
     interface the host has), e.g. ["127.0.0.1","::1","192.168.1.74",
     "fe80::286f:d277:a3f3:9e2d"] -- not just the one meaningful address.
     127.0.0.1/::1 are identical on every host (zero pivot value as "which
     endpoint"), and a link-local address is interface-scoped and not
-    globally unique either. Both were reaching the endpoint-ip observable
-    unfiltered before this fix. Private-but-routable addresses (the
+    globally unique either -- both would otherwise reach the endpoint-ip
+    observable unfiltered. Private-but-routable addresses (the
     192.168.1.74 in that same real list) are deliberately KEPT -- that IS
     the real, useful host identity, same as classify_ip's own internal/
     external split treats a private address as legitimate, just not
@@ -487,18 +459,17 @@ def normalize_ip_list(raw):
 
 def extract_context(alert):
     """hostname/host_ip/agent_id resolution for Sigma/YARA (EDR telemetry:
-    dataset endpoint.events.*) -- Suricata no longer calls this, see
-    normalize_suricata_alert.
+    dataset endpoint.events.*). Suricata has its own normalizer
+    (normalize_suricata_alert) and never calls this function.
 
     `metadata.input.beats.host.ip` (and any dict keyed "host" found by the
     blind BFS fallback) is the IP of whichever machine is RUNNING the
     beats/elastic-agent shipper. For Sigma/YARA that shipper runs ON the
-    monitored endpoint, so it IS the host's own IP -- legitimate. (This
-    used to be conditional on source_engine != 'suricata', because for
-    Suricata's passive-sensor shipper it is NOT the host's own IP --
-    verified live 2026-08-17, a fabricated "unknown-host (172.20.24.40)"
-    title from the sensor's own management IP. That conditional is gone
-    now that Suricata never reaches this function at all.)
+    monitored endpoint, so it IS the host's own IP -- legitimate. (For a
+    passive network sensor's shipper, that same field would be the
+    sensor's own management IP, not the monitored host's -- a trap this
+    function avoids by never being called for that case, since Suricata
+    is routed to its own normalizer instead.)
     """
     hostname = first_non_empty(
         get_path(alert, 'host.name'), get_path(alert, 'host.hostname'),
@@ -544,10 +515,9 @@ def resolve_network_flow(alert):
     """The flow identity for any network-behavior alert -- Suricata NIDS,
     or a Zeek-backed Sigma rule (lateral movement, SMB/RDP anomalies), both
     of which use the same source.ip/destination.ip/network.transport ECS
-    shape. Real field names verified live 2026-08-17 against a real
-    suricata.alert doc -- NOT the flat src_ip/dest_ip/proto that only
-    exist in the raw, un-normalized eve.json (nested inside `message`,
-    excluded from scanning above).
+    shape. These are the real, normalized field names -- NOT the flat
+    src_ip/dest_ip/proto that only exist in the raw, un-normalized
+    eve.json (nested inside `message`, excluded from scanning above).
 
     Checks the top-level path first (the confirmed-real shape), then falls
     back to a deep tree search (find_all_dicts_by_key) for alerts that
@@ -580,21 +550,13 @@ def resolve_network_flow(alert):
 
 
 
-# Suricata attacker/victim role-tagging (category/classtype based) lived
-# here until 2026-09-05 -- removed, not ported, when Suricata got its own
-# normalize_suricata_alert: that function's tag spec is definitive and
-# deliberately simpler (internal-source/external-source only, no
-# attacker/victim role guess). See git history if this heuristic is ever
-# wanted back for a DIFFERENT engine's network-behavior rules.
-
-
 def extract_iocs(alert: dict) -> dict:
     """Extract threat-intel-ready IOCs from a Sigma/YARA alert of any
-    shape. Suricata no longer calls this -- see normalize_suricata_alert,
-    a dedicated table-driven normalizer for Suricata's fully-confirmed
-    ECS shape (2026-09-05). This blind, schema-agnostic tree scan exists
-    for Sigma/YARA specifically because their real-world field shapes are
-    far less predictable (Sysmon event-type variety, cloud/identity/proxy
+    shape. Suricata has its own dedicated, table-driven normalizer
+    (normalize_suricata_alert) for its fully-confirmed ECS shape and never
+    calls this function. This blind, schema-agnostic tree scan exists for
+    Sigma/YARA specifically because their real-world field shapes are far
+    less predictable (Sysmon event-type variety, cloud/identity/proxy
     Sigma sources with no dedicated field mapping in this repo, YARA/
     Strelka's PE-metadata sprawl)."""
     if not isinstance(alert, dict):
@@ -630,10 +592,9 @@ def extract_iocs(alert: dict) -> dict:
         for m in DOMAIN_RE.finditer(text):
             # PowerShell type-accelerator syntax ([Net.ServicePointManager],
             # [Net.SecurityProtocolType]) is dot-shaped and matches the same
-            # pattern as a domain -- verified live 2026-08-18 against the
-            # real Sigma fixture's command_line/args text. Structurally
-            # distinct from a real domain: always wrapped in [...] in
-            # PowerShell syntax, which a domain never is.
+            # pattern as a domain, and shows up routinely in command_line/args
+            # text. Structurally distinct from a real domain: always wrapped
+            # in [...] in PowerShell syntax, which a domain never is.
             before = text[m.start() - 1] if m.start() > 0 else ''
             after = text[m.end()] if m.end() < len(text) else ''
             if before == '[' or after == ']':
@@ -737,11 +698,10 @@ def resolve_rule_uuid(alert):
 
 
 def resolve_severity(alert):
-    """Sigma/YARA severity resolution. Suricata has its own
-    _map_suricata_severity (2026-09-05, stricter per spec: event.
-    severity_label only, no scan_strings fallback, no raw Suricata
-    alert.severity handling -- that inverted-scale mapping lived here
-    until this function stopped being called for Suricata at all)."""
+    """Sigma/YARA severity resolution. Suricata has its own, stricter
+    `_map_suricata_severity` (event.severity_label only, no scan_strings
+    fallback, no raw Suricata alert.severity handling) and never calls
+    this function."""
     label = first_non_empty(
         get_path(alert, 'sigma_level'),
         get_path(alert, 'event.severity_label'),
@@ -791,7 +751,7 @@ def resolve_source_ref(alert, hostname, rule_uuid, timestamp_ms):
 def resolve_context_line(alert, source_engine):
     """One short line of extra context for the description, engine-specific.
     Sigma/YARA only -- Suricata builds its own description entirely in
-    _build_suricata_description (2026-09-05)."""
+    _build_suricata_description."""
     if source_engine == 'sigma':
         cmd = get_path(alert, 'event_data.process.command_line')
         parent_cmd = get_path(alert, 'event_data.process.parent.command_line')
@@ -812,21 +772,19 @@ def resolve_context_line(alert, source_engine):
 # ==================================================================
 # SECTION 3 -- observables (IOCs only)
 # ==================================================================
-# SOC-3s deployment decision, 2026-09-04: alert-level tag extraction
-# (build_tags -- engine/rule/agent-id/sensor/flow/hostname/host_ip as
-# free-standing tag strings on the ALERT itself) is removed. hostname/
-# host_ip/agent_id context still reaches TheHive -- via the description
-# text and, per the observable rework above, as endpoint-ip/hostname/
-# process-* observables -- just not duplicated a third time as alert tags.
+# Alert-level tag extraction (engine/rule/agent-id/sensor/flow/hostname/
+# host_ip as free-standing tag strings on the ALERT itself) is out of
+# scope. hostname/host_ip/agent_id context still reaches TheHive -- via
+# the description text and, per the observable set below, as
+# endpoint-ip/hostname observables -- just not duplicated a third time
+# as alert tags.
 def build_observables(iocs, hash_owners=None):
     """Observables built ONLY from actual IOCs -- external IPs, domains,
     URLs, hashes. hostname/host_ip/agent_id are NEVER included here.
 
-    SOC-3s deployment decision, 2026-09-05: the re&ct:<category> tag
-    every observable used to carry (network for ip/domain/url, file for
-    hash) is removed -- Sigma/YARA observables carry no category tag at
-    all now, only the algorithm tag (md5/sha1/.../imphash) and, where
-    applicable, the `process:<name>`/`known-legitimate` tags below.
+    Observables carry no `re&ct:<category>` tag -- only the algorithm tag
+    (md5/sha1/.../imphash) on hashes and, where applicable, the
+    `process:<name>`/`file:<name>`/`known-legitimate` tags below.
 
     This also covers the YARA/Strelka file-hash case: Strelka's real
     field names (hash.sha256/hash.md5, per so-alert-reference/ingest/
@@ -834,16 +792,15 @@ def build_observables(iocs, hash_owners=None):
     extractor above already catches correctly with ioc:true -- no
     separate YARA resolver needed.
 
-    `hash_owners` (from `_extract_hash_owners`, SOC-3s deployment
-    decision, 2026-09-05/06): a {hash_lowercased: (kind, owner_name)} map
-    -- ANY hash that is genuinely traceable to a specific process OR file
-    (not just found somewhere else in the alert tree) gets an extra
-    `process:<name>` or `file:<name>` tag (kind-specific -- a file-owned
-    hash, e.g. YARA/Strelka's, is never mislabeled `process:`), so an
-    analyst pivoting on the hash observable can see where it came from
-    without cross-referencing other observables (there are none to
-    cross-reference against any more, 2026-09-06 -- this tag is now the
-    ONLY place that provenance survives at all)."""
+    `hash_owners` (from `_extract_hash_owners`): a
+    {hash_lowercased: (kind, owner_name)} map -- ANY hash that is
+    genuinely traceable to a specific process OR file (not just found
+    somewhere else in the alert tree) gets an extra `process:<name>` or
+    `file:<name>` tag (kind-specific -- a file-owned hash, e.g.
+    YARA/Strelka's, is never mislabeled `process:`), so an analyst
+    pivoting on the hash observable can see where it came from -- this
+    tag is the only place that provenance survives on the hash
+    observable itself."""
     hash_owners = hash_owners or {}
 
     def hash_tags(h, *base_tags):
@@ -896,20 +853,18 @@ def build_observables(iocs, hash_owners=None):
 def _network_flow_response_observables(alert):
     """Source-of-alert context (hostname, endpoint-ip) for Zeek-backed
     Sigma network-behavior rules (lateral movement, SMB/RDP anomalies --
-    the same source.ip/destination.ip/network.transport ECS shape
-    Suricata also used to share this function with, see
-    resolve_network_flow). Suricata now has its own
-    normalize_suricata_alert instead (2026-09-05) -- this function is
-    Sigma-only now.
+    the same source.ip/destination.ip/network.transport ECS shape, see
+    resolve_network_flow). Sigma-only -- Suricata alerts are normalized by
+    normalize_suricata_alert instead.
 
-    SOC-3s deployment decision, 2026-09-06: this script's mission is
-    IOC-only (hash/domain/url/external-ip) plus minimal source-of-alert
-    context -- the autonomous-system observable for the EXTERNAL side is
-    removed (it's neither an IOC in the hash/domain/url/external-ip sense
-    nor source-of-alert context; ASN attribution for an external IP is
-    threat-intel enrichment that belongs downstream, e.g. OpenCTI/Cortex
-    in the real SOC-3s pipeline, not this script). Only the INTERNAL
-    side's endpoint-ip and source/destination.hostname remain."""
+    This script's mission is IOC-only (hash/domain/url/external-ip) plus
+    minimal source-of-alert context. No autonomous-system observable is
+    produced for the EXTERNAL side of a flow -- it's neither an IOC in the
+    hash/domain/url/external-ip sense nor source-of-alert context; ASN
+    attribution for an external IP is threat-intel enrichment that
+    belongs downstream (OpenCTI/Cortex), not this script. Only the
+    INTERNAL side's endpoint-ip and source/destination.hostname are
+    produced here."""
     observables = []
     src, dst, _proto = resolve_network_flow(alert)
     if not src or not dst:
@@ -918,9 +873,9 @@ def _network_flow_response_observables(alert):
     for ip in (src, dst):
         if classify_ip(ip) != 'internal':
             continue
-        # SOC-3s deployment decision, 2026-09-04: the internal/endpoint
-        # side of a flow (our own asset) is reported under the custom
-        # `endpoint-ip` dataType, not `ip` -- keeps "our asset's address"
+        # The internal/endpoint side of a flow (our own asset) is reported
+        # under the custom `endpoint-ip` dataType, not `ip` -- keeps "our
+        # asset's address"
         # (a response/pivot handle) visually and structurally distinct
         # from `ip` threat-intel observables (external_ips, always the
         # OTHER side of the flow, built in build_observables).
@@ -982,21 +937,18 @@ def _extract_hash_owners(alert):
     to its owner in each:
 
     1. Process-owned hash (Sigma/Elastic Endpoint) -- the hash is NESTED
-       INSIDE the process object, alongside its name/pid. Live-verified
-       2026-09-05 against tests/fixtures/sigma-alert-real.json:
+       INSIDE the process object, alongside its name/pid:
        event_data.process.name == "powershell.exe", event_data.
        process.hash == {"sha256": "1c84c863..."} (Elastic Endpoint's own
        hash.* dict -- the process's OWN executable hash, distinct from
-       process.pe.imphash, the PE import-table hash, also present on
-       this same real alert). The parent block in that same real alert
-       has neither `hash` nor `pe` populated (Elastic doesn't always
-       compute a parent's own hash) -- both read defensively, never
-       assumed present.
+       process.pe.imphash, the PE import-table hash, also carried on the
+       same process object). A parent block commonly has neither `hash`
+       nor `pe` populated (Elastic doesn't always compute a parent's own
+       hash) -- both read defensively, never assumed present.
 
     2. File-owned hash (YARA/Strelka) -- the hash is a SIBLING of the
        file object, both direct children of the SAME parent dict, not
-       nested inside it. Live-verified 2026-09-05 against a real
-       logs-strelka-so* document: the alert's own top level has `file`
+       nested inside it: a real Strelka document's top level has `file`
        ({"name": "/nsm/strelka/staging/...exe", ...}) and `hash`
        ({"sha1": ..., "sha256": ..., "md5": ..., "tlsh": ..., "ssdeep":
        ...}) as two separate keys of the SAME dict -- there is no
@@ -1048,21 +1000,16 @@ def _extract_hash_owners(alert):
 
 def _source_context_observables(hostname, host_ips):
     """The alert's own source/asset identity -- hostname and the
-    endpoint's own IP(s) -- NOT threat-intel (ioc:false), but kept
-    because this script's mission still needs to say WHICH host/asset an
-    alert is about, even though it no longer extracts anything about
-    what that host was DOING (process/registry/file-path).
-
-    SOC-3s deployment decision, 2026-09-06 -- SCOPE NARROWED: replaces
-    _sigma_response_observables/_yara_response_observables/
-    _file_identity_pairs (removed, see git history). Process identity
-    (path/pid/entity-id), host-id, registry, and file-path observables
-    are no longer extracted for either engine -- this script's mission is
-    IOC-only (hash/url/domain/external-ip, see build_observables) plus
+    endpoint's own IP(s) -- NOT threat-intel (ioc:false), kept because
+    this script's mission still needs to say WHICH host/asset an alert is
+    about. Process identity (path/pid/entity-id), host-id, registry, and
+    file-path are not extracted as observables -- this script's mission
+    is IOC-only (hash/url/domain/external-ip, see build_observables) plus
     this minimal source-of-alert pair, not general incident-response
-    tooling data. Shared by Sigma AND YARA now (previously YARA got no
-    source-context observables at all); in practice this still no-ops
-    for YARA/Strelka alerts in this deployment, since the real Strelka
+    tooling data.
+
+    Shared by Sigma AND YARA alike; in practice this still no-ops for
+    YARA/Strelka alerts in this deployment, since the real Strelka
     document shape has no "host" block to extract from at all."""
     observables = []
 
@@ -1089,7 +1036,7 @@ def resolve_response_observables(alert, source_engine, hostname, host_ips):
     only, see _source_context_observables) plus, for Sigma specifically,
     the same pair derived from a Zeek-backed network-behavior rule's flow
     (_network_flow_response_observables). Suricata has its own
-    normalize_suricata_alert and never reaches this function (2026-09-05)."""
+    normalize_suricata_alert and never reaches this function."""
     observables = _source_context_observables(hostname, host_ips)
     if source_engine == 'sigma':
         observables += _network_flow_response_observables(alert)
@@ -1097,7 +1044,7 @@ def resolve_response_observables(alert, source_engine, hostname, host_ips):
 
 
 # ==================================================================
-# SECTION 4 -- Suricata-only normalizer (2026-09-05)
+# SECTION 4 -- Suricata-only normalizer
 # ==================================================================
 # Suricata alerts do NOT go through SECTIONS 1-3 above (the blind,
 # schema-agnostic tree scan built for Sigma/YARA's far less predictable
@@ -1134,9 +1081,9 @@ def _map_suricata_severity(severity_label):
     already consumed and transformed into event.severity by
     common.nids, then into event.severity_label by common, before this
     document exists; event.severity_label is the only reliable source
-    left at this stage of the pipeline. (The old inverted-scale
-    alert.severity mapping this replaced for Suricata now lives only in
-    git history -- resolve_severity above is Sigma/YARA-only.)"""
+    left at this stage of the pipeline. resolve_severity above is
+    Sigma/YARA-only; Suricata always goes through this function
+    instead."""
     return _SURICATA_SEVERITY_LABEL_MAP.get(severity_label, 2)  # 2 = medium if absent/unexpected
 
 
@@ -1321,8 +1268,8 @@ def _build_suricata_description(alert):
 
 
 def normalize_suricata_alert(alert: dict) -> dict:
-    """Suricata-only entry point, per the dedicated spec this implements
-    (2026-09-05). `alert` is already unwrapped (build_hive_alert does
+    """Suricata-only entry point, per the dedicated spec this implements.
+    `alert` is already unwrapped (build_hive_alert does
     that before dispatching here) -- the ECS-normalized Suricata document
     itself, fields at its own top level (rule/source/destination/network/
     event/...), not the n8n webhook envelope.
@@ -1377,14 +1324,13 @@ def build_hive_alert(alert: dict) -> dict:
     """Entry point: raw SOC alert of any shape -> full TheHive 5 alert
     body, metadata AND observables.
 
-    SOC-3s deployment decision, 2026-09-05: Suricata alerts are dispatched
-    to `normalize_suricata_alert` immediately and do not run any of the
-    Sigma/YARA logic below -- Suricata's ECS shape is fully confirmed
-    field-by-field (the so-alert-reference pipeline chain, read
-    source-to-source, not inferred from samples), so it gets its own
-    table-driven, schema-exact normalizer per a dedicated spec, instead of
-    the blind whole-tree IOC scan built for Sigma/YARA's far less
-    predictable shapes. Sigma/YARA are UNCHANGED by this split."""
+    Suricata alerts are dispatched to `normalize_suricata_alert`
+    immediately and do not run any of the Sigma/YARA logic below --
+    Suricata's ECS shape is fully confirmed field-by-field (the
+    so-alert-reference pipeline chain, read source-to-source, not
+    inferred from samples), so it gets its own table-driven, schema-exact
+    normalizer, instead of the blind whole-tree IOC scan built for
+    Sigma/YARA's far less predictable shapes."""
     if not isinstance(alert, dict):
         alert = {}
     alert = unwrap_webhook(alert)

@@ -1,0 +1,79 @@
+name: Custom.Windows.Remediation.IsolateHost
+description: |
+  Network-isolates a Windows endpoint using netsh advfirewall. Allow rules
+  for the Velociraptor server are created FIRST, then blockinbound/
+  blockoutbound policy is applied -- this ordering is required so the
+  endpoint never loses Velociraptor connectivity mid-isolation.
+
+  ISOLATE (RemovePolicy=FALSE): adds VR_ISOLATE_IN/VR_ISOLATE_OUT allow
+  rules scoped to VelociraptorServerIP, then sets firewallpolicy to
+  blockinbound,blockoutbound on all profiles.
+
+  UN-ISOLATE (RemovePolicy=TRUE): restores firewallpolicy to
+  blockinbound,allowoutbound FIRST (so connectivity returns even if a
+  later step fails), then removes the VR_ISOLATE_IN/VR_ISOLATE_OUT rules.
+  This restores Windows Firewall FACTORY DEFAULT -- explicitly NOT
+  necessarily the host's original policy. If the host's firewall was
+  GPO-managed or otherwise hardened beyond factory default, that original
+  state is not recovered by this artifact. Known, documented limitation,
+  not an oversight.
+
+  ReallyDoIt=FALSE (default) is a dry run.
+
+author: TrustShield / SOC-3s
+type: CLIENT
+
+parameters:
+  - name: VelociraptorServerIP
+    default: ""
+    description: >
+      Velociraptor server address, bare IP (e.g. 100.84.64.90). Must match
+      the address this client actually uses per its own client.config.yaml
+      server_urls -- never assumed from documentation.
+
+  - name: RemovePolicy
+    type: bool
+    default: N
+    description: >
+      TRUE = un-isolate: restore factory-default firewall policy
+      (blockinbound,allowoutbound -- NOT necessarily the host's original
+      policy) and remove the VR_ISOLATE_IN/VR_ISOLATE_OUT rules.
+      FALSE (default) = isolate.
+
+  - name: ReallyDoIt
+    type: bool
+    default: N
+    description: >
+      TRUE = actually run the commands. FALSE (default) = dry run.
+
+precondition: SELECT OS FROM info() WHERE OS = 'windows'
+
+sources:
+  - query: |
+      LET Isolate_a = ("netsh", "advfirewall", "firewall", "add", "rule", "name=VR_ISOLATE_IN", "dir=in", "action=allow", "remoteip=" + VelociraptorServerIP)
+      LET Isolate_b = ("netsh", "advfirewall", "firewall", "add", "rule", "name=VR_ISOLATE_OUT", "dir=out", "action=allow", "remoteip=" + VelociraptorServerIP)
+      LET Isolate_c = ("netsh", "advfirewall", "set", "allprofiles", "firewallpolicy", "blockinbound,blockoutbound")
+
+      LET Remove_a = ("netsh", "advfirewall", "set", "allprofiles", "firewallpolicy", "blockinbound,allowoutbound")
+      LET Remove_b = ("netsh", "advfirewall", "firewall", "delete", "rule", "name=VR_ISOLATE_IN")
+      LET Remove_c = ("netsh", "advfirewall", "firewall", "delete", "rule", "name=VR_ISOLATE_OUT")
+
+      LET IsolateCmds = SELECT * FROM chain(
+        a={ SELECT Isolate_a AS Argv FROM scope() },
+        b={ SELECT Isolate_b AS Argv FROM scope() },
+        c={ SELECT Isolate_c AS Argv FROM scope() }
+      )
+
+      LET RemoveCmds = SELECT * FROM chain(
+        a={ SELECT Remove_a AS Argv FROM scope() },
+        b={ SELECT Remove_b AS Argv FROM scope() },
+        c={ SELECT Remove_c AS Argv FROM scope() }
+      )
+
+      LET Commands <= SELECT * FROM if(condition=RemovePolicy, then=RemoveCmds, else=IsolateCmds)
+
+      SELECT * FROM foreach(row=Commands, query={
+        SELECT * FROM if(condition=ReallyDoIt,
+           then={ SELECT Argv, Stdout, Stderr, ReturnCode FROM execve(argv=Argv) },
+           else={ SELECT Argv, "DRY RUN - not executed" AS Stdout, "" AS Stderr, 0 AS ReturnCode FROM scope() })
+      })

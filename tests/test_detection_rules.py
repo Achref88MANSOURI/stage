@@ -1,18 +1,15 @@
-"""`detection_rule_lookup` — architecture §6 tool 2.
+"""Tests for `detection_rule_lookup`.
 
-PROVENANCE: `tests/fixtures/so_detection_5e3cc4d8.json` is the ACTUAL captured
-response from the live `so-detection` index on 2026-08-08 for rule
-`5e3cc4d8-3e68-43db-8656-eaaeefdec9cc`, saved verbatim per implementation guide
-§2 step 6 — not an imagined shape. The tool was called against the real backend
-before any of these tests were written.
+`tests/fixtures/so_detection_5e3cc4d8.json` is the actual response captured
+from the live `so-detection` index for rule
+`5e3cc4d8-3e68-43db-8656-eaaeefdec9cc`, saved verbatim.
 
-`_parse_suricata_content` (added 2026-08-18) IS verified against real rules —
-`TestSuricataMetadataParsing` below reads `so_detection_2100498.json` and
-`so_detection_suricata_mitre_real.json`, both real captures. YARA is still
-synthetic-only: confirmed live 2026-08-18 that 0 of 4,321 real YARA rule
-bodies in this deployment contain any MITRE reference, and no `strelka.*`
-alert index exists, so there's neither data to extract nor an alert path to
-verify a parser against (see `tools/detection_rules.py`'s module docstring).
+`_parse_suricata_content` is verified against two more real captures,
+`so_detection_2100498.json` and `so_detection_suricata_mitre_real.json`
+(see `TestSuricataMetadataParsing` below). YARA parsing remains untested
+against real data: none of the 4,321 real YARA rule bodies checked in this
+deployment carry a MITRE reference, and no `strelka.*` alert index exists
+here to validate against (see `tools/detection_rules.py`).
 """
 
 from __future__ import annotations
@@ -44,23 +41,23 @@ SURICATA_MITRE_FIXTURE = (
 
 @pytest.fixture
 def real_es_response() -> dict:
-    """REAL — captured live from so-detection on 2026-08-08."""
+    """REAL — captured live from so-detection."""
     return json.loads(FIXTURE.read_text())
 
 
 @pytest.fixture
 def real_suricata_es_response() -> dict:
-    """REAL — captured live from so-detection on 2026-08-18, SID 2100498 (the
-    rule tied to `tests/fixtures/suricata-alert-real.json`). Has a `metadata:`
-    clause but no MITRE keys — the common case: 34,976 of 67,434 real
-    Suricata rules (52%) carry no ATT&CK mapping at all."""
+    """REAL — captured live from so-detection, SID 2100498 (the rule tied to
+    `tests/fixtures/suricata-alert-real.json`). Has a `metadata:` clause but
+    no MITRE keys — the common case: roughly half of real Suricata rules
+    carry no ATT&CK mapping at all."""
     return json.loads(SURICATA_FIXTURE.read_text())
 
 
 @pytest.fixture
 def real_suricata_mitre_es_response() -> dict:
-    """REAL — captured live from so-detection on 2026-08-18, SID 2001482, one
-    of the 32,458 real Suricata rules (48%) that DO carry a parseable
+    """REAL — captured live from so-detection, SID 2001482, one of the real
+    Suricata rules that DO carry a parseable
     `mitre_tactic_id`/`mitre_technique_id` metadata clause."""
     return json.loads(SURICATA_MITRE_FIXTURE.read_text())
 
@@ -116,8 +113,9 @@ class TestAgainstRealCapturedResponse:
     def test_falsepositive_placeholder_yields_false_boolean(
         self, monkeypatch, real_es_response
     ):
-        """Raw list is preserved for audit; the derived boolean is what Stage 3
-        reads, so it never reasons about an FP condition named "Unknown"."""
+        """Raw list is preserved for audit; the derived boolean is what
+        downstream reasoning reads, so it never reasons about an FP condition
+        named "Unknown"."""
         patch_es(monkeypatch, result=real_es_response)
         context, _ = run(detection_rule_lookup(REAL_UUID))
         assert context.falsepositives == ["Unknown"]
@@ -253,8 +251,9 @@ class TestFailuresProduceGapsNotExceptions:
         assert "unexpected document shape" in gap.reason
 
     def test_malformed_yaml_degrades_without_losing_doc_fields(self, monkeypatch):
-        """A content parse failure must not lose title/severity — architecture
-        §6 says MITRE falls back to Qdrant, the rule stays usable."""
+        """A content parse failure must not lose title/severity: MITRE
+        mapping falls back to Qdrant retrieval, but the rule itself stays
+        usable."""
         patch_es(
             monkeypatch,
             result={
@@ -409,12 +408,12 @@ class TestSyntheticNonSigmaLanguages:
         assert context.found is True
         assert context.source_engine == "suricata"
         assert context.title == "ET MALWARE Observed DNS Query"
-        # A Suricata signature is not YAML; MITRE stays empty and Stage 2's
-        # Qdrant retrieval is the fallback, per architecture §6.
+        # A Suricata signature is not YAML; MITRE stays empty and Qdrant
+        # retrieval is the fallback.
         assert context.mitre_attack == []
 
     # NOTE: YARA path — unit-tested against a synthetic document only, same
-    # reason as above (implementation guide §0.1).
+    # reason as above.
     def test_yara_rule_keeps_doc_fields(self, monkeypatch):
         patch_es(
             monkeypatch,
@@ -445,10 +444,10 @@ class TestSyntheticNonSigmaLanguages:
 # `_parse_suricata_content` — direct unit tests against REAL rule text
 # ===========================================================================
 class TestSuricataMetadataParsing:
-    """Live-verified 2026-08-18 against 5 real Suricata rules (SIDs 2001482,
-    2001485, 2001734, 2002016, 2016781) plus the rule tied to the real
-    captured alert (SID 2100498). Content strings below are copied verbatim
-    from those live `so-detection` responses, not reconstructed by hand."""
+    """Content strings below are copied verbatim from real `so-detection`
+    responses for 5 real Suricata rules (SIDs 2001482, 2001485, 2001734,
+    2002016, 2016781) plus the rule tied to the captured alert fixture
+    (SID 2100498)."""
 
     REAL_2100498 = (
         'alert ip any any -> any any (msg:"GPL ATTACK_RESPONSE id check returned root"; '
@@ -536,8 +535,9 @@ class TestSuricataMetadataParsing:
         ],
     )
     def test_severity_map_covers_all_four_real_values(self, suricata_value, expected_level):
-        """These 4 values cover 67,064 of 67,434 real Suricata rules with a
-        signature_severity key — confirmed live 2026-08-18."""
+        """These 4 values cover the large majority of real Suricata rules
+        that carry a signature_severity key, confirmed live against this
+        deployment's rule set."""
         context = RuleContext()
         content = f'alert tcp any any -> any any (msg:"x"; sid:1; rev:1; metadata:signature_severity {suricata_value};)'
         _parse_suricata_content(content, context)

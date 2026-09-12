@@ -1,33 +1,21 @@
-"""TheHive case correlation — architecture §6 tools 3 and 4.
+"""Tests for TheHive case correlation.
 
-PROVENANCE, two tiers:
+`tests/fixtures/thehive_real.json` was captured from a live TheHive 5.7.5-1
+instance: the `/api/v1/describe/*` enum vocabularies, real query results,
+case observables, and the stock two-call shape `get_full_alert_with_analysis`
+uses. Three real cases exist in the capture: `~8609848` (New/New, a
+manually-created test case with no observables of its own, which shows an
+open-case entity match can legitimately come back empty without a broken
+query), `~4653208` (Closed/FalsePositive), and `~8613944` (Closed/TruePositive).
 
-- `tests/fixtures/thehive_real.json` is REAL, captured live from TheHive
-  **5.7.5-1** at `172.20.24.228` on 2026-08-13: the `/api/v1/describe/*` enum
-  vocabularies, genuine query results, case observables, and — replacing the
-  retired custom Function's payload — the stock two-call `getAlert` +
-  `getAlert -> observables` shape `get_full_alert_with_analysis` now calls.
+The remaining `SYNTHETIC_*` rows cover resolution statuses the live instance
+has no example of (Indeterminate, duplicate handling), with every enum value
+still drawn from the captured vocabulary.
 
-  Supersedes the 2026-08-09 capture from 5.7.3 at `172.20.24.221` (that
-  instance moved and was upgraded again; its alert/case ids no longer exist).
-
-  Three real cases exist this time — `~8609848` New/New (a manually-created
-  "test" case with **zero** observables of its own — real fixture data now
-  proves an open-case entity match can legitimately come back empty without a
-  broken query), `~4653208` Closed/FalsePositive, and `~8613944`
-  Closed/TruePositive. This is an improvement on the 2026-08-09 capture, which
-  only had a TruePositive closed case — FalsePositive summarisation is now
-  also proven against real data, not just `SYNTHETIC_CLOSED_FP`.
-
-- The remaining `SYNTHETIC_*` rows stay synthetic, covering resolution
-  statuses the live instance still has no example of (Indeterminate,
-  duplicate handling). Every enum value is drawn from the captured live
-  vocabulary.
-
-`test_real_schema_enums_are_what_the_code_assumes` is the guard that matters
-most — it pins the synthetic rows to the captured vocabulary, so if TheHive's
-model changes they cannot quietly keep passing against a model that no longer
-exists.
+`test_real_schema_enums_are_what_the_code_assumes` matters most here: it pins
+the synthetic rows to the captured vocabulary, so a change to TheHive's model
+would fail this test first rather than leaving the synthetic fixtures
+silently testing a model that no longer exists.
 """
 
 from __future__ import annotations
@@ -39,10 +27,8 @@ from pathlib import Path
 import httpx
 import pytest
 
-from schemas import HashBundle, Observables
 from tools import thehive as th
 from tools.thehive import (
-    _entity_values,
     fetch_case_observables_with_type,
     search_open_cases_by_entities,
 )
@@ -56,27 +42,18 @@ SHA256 = "1c84c8632c5269f24876ed9f49fa810b49f77e1e92e8918fc164c34b020f9a94"
 
 @pytest.fixture(scope="module")
 def real() -> dict:
-    """REAL — captured live from TheHive 5.7.3 on 2026-08-09."""
+    """Captured live from TheHive."""
     return json.loads(FIXTURE.read_text())
 
 
 @pytest.fixture(scope="module")
 def real_similar_cases() -> list:
-    """REAL — `getAlert(~4661456) -> similarCases`, captured live 2026-08-19
-    (gap #12). Same alert TestGetFullAlertWithAnalysis already uses. Two
-    real cases, both stage=="Closed" (~8613944 TruePositive, ~4653208
-    FalsePositive) — proves the exclusion side of the open-case stage
-    filter; SYNTHETIC_SIMILAR_OPEN_ROW below proves the inclusion side."""
+    """`getAlert(~4661456) -> similarCases`, the same alert
+    TestGetFullAlertWithAnalysis uses. Both real cases here are
+    stage=="Closed" (~8613944 TruePositive, ~4653208 FalsePositive), which
+    covers the exclusion side of the open-case stage filter;
+    SYNTHETIC_SIMILAR_OPEN_ROW below covers the inclusion side."""
     return json.loads(SIMILAR_CASES_FIXTURE.read_text())
-
-
-def observables(**kw) -> Observables:
-    return Observables(
-        external_ips=kw.get("ips", []),
-        domains=kw.get("domains", []),
-        urls=kw.get("urls", []),
-        hashes=HashBundle(sha256=kw.get("sha256", [])),
-    )
 
 
 def patch_query(monkeypatch, results=None, exc=None, capture=None):
@@ -122,11 +99,11 @@ def run(coro):
 
 
 def _enum_values(describe_doc: dict, field: str) -> list:
-    """`/api/v1/describe/<entity>`'s envelope changed shape between 5.7.3 and
-    5.7.5-1: the old capture was a flat `{field: [values]}` dict, the new one
-    is `{label, path, initialQuery, attributes: [{name, values, ...}, ...]}`.
-    Dev-time-only endpoint (see tools/thehive.py's `_describe_error` docstring
-    reference) — nothing at runtime reads this shape, only these tests."""
+    """`/api/v1/describe/<entity>` wraps its enum values as
+    `{label, path, initialQuery, attributes: [{name, values, ...}, ...]}`.
+    This is a dev-time-only endpoint (see tools/thehive.py's
+    `_describe_error` docstring) — nothing at runtime reads this shape,
+    only these tests."""
     for attr in describe_doc.get("attributes", []):
         if attr.get("name") == field:
             return attr.get("values", [])
@@ -145,8 +122,8 @@ SYNTHETIC_OPEN_CASE = {
     "_createdAt": 1785971216169,
 }
 # SYNTHETIC similarCases row — proves the OPEN/inclusion side of the stage
-# filter (gap #12), since the one real fixture only has closed examples.
-# Wraps the already-real-schema-vocabulary SYNTHETIC_OPEN_CASE.
+# filter, since the one real fixture only has closed examples. Wraps the
+# already-real-schema-vocabulary SYNTHETIC_OPEN_CASE.
 SYNTHETIC_SIMILAR_OPEN_ROW = {
     "case": SYNTHETIC_OPEN_CASE,
     "similarObservableCount": 3,
@@ -157,10 +134,9 @@ SYNTHETIC_SIMILAR_OPEN_ROW = {
 
 class TestAgainstRealCapturedCases:
     def test_real_schema_enums_are_what_the_code_assumes(self, real):
-        """THE ANCHOR TEST. Every synthetic case row below uses these values.
-        If TheHive's vocabulary changes, this fails first and the synthetic
-        fixtures stop being trustworthy — rather than passing forever against a
-        model that no longer exists."""
+        """The anchor test: every synthetic case row below uses these
+        values, so a change to TheHive's vocabulary fails here first
+        instead of leaving the synthetic fixtures silently stale."""
         case = real["describe_case_enums"]
         assert _enum_values(case, "stage") == ["New", "InProgress", "Closed"]
         assert set(_enum_values(case, "status")) == {
@@ -177,136 +153,14 @@ class TestAgainstRealCapturedCases:
         assert set(_enum_values(case, "stage")) != set(_enum_values(case, "status"))
         assert "TruePositive" not in _enum_values(case, "stage")
 
-    def test_real_open_query_returns_no_matches(self, real):
-        """REAL RESULT, 2026-08-13. Three cases exist: `~8609848` New/New (a
-        manually-created "test" case), `~4653208` Closed/FalsePositive,
-        `~8613944` Closed/TruePositive. The entity query correctly returns
-        EMPTY — not because it's broken, but because the only open case has
-        zero observables of its own (confirmed via a direct getCase ->
-        observables call), so it cannot share an entity with anything. No
-        closed case leaks in either way, which the closed query below proves
-        is a real, working match."""
-        assert real["open_cases_by_entity"] == []
-        open_ids = {c["_id"] for c in real["all_cases"] if c["stage"] != "Closed"}
-        assert open_ids == {"~8609848"}
-
-    def test_real_open_case_query_maps_empty_result_cleanly(self, monkeypatch, real):
-        """Feeding the tool the exact real (empty) response must produce an
-        empty case list with NO gap — empty-with-no-gap is the correct
-        real answer here, not a failure to distinguish from a broken query."""
-        patch_query(monkeypatch, results=[real["open_cases_by_entity"], []])
-        cases, gap = run(search_open_cases_by_entities(observables(sha256=[SHA256])))
-        assert gap is None
-        assert cases == []
-
-
-class TestOpenCaseQueryConstruction:
-    def test_filters_on_stage_not_status(self, monkeypatch):
-        """The single most dangerous mistake available here."""
-        capture: dict = {}
-        patch_query(monkeypatch, results=[], capture=capture)
-        run(search_open_cases_by_entities(observables(sha256=[SHA256])))
-        steps = capture["bodies"][0]["query"]
-        stage_filters = [
-            s for s in steps if s.get("_name") == "filter" and "stage" in json.dumps(s)
-        ]
-        assert stage_filters, "no stage filter present"
-        assert stage_filters[0]["_ne"] == {"_field": "stage", "_value": "Closed"}
-        assert '"_field": "status"' not in json.dumps(steps)
-
-    def test_traverses_observable_first_not_case_first(self, monkeypatch):
-        """Observable-first keeps the entity match on an index. Case-first would
-        walk every case and inspect its observables — fine at 0 cases, hopeless
-        at 10,000."""
-        capture: dict = {}
-        patch_query(monkeypatch, results=[], capture=capture)
-        run(search_open_cases_by_entities(observables(sha256=[SHA256])))
-        names = [s.get("_name") for s in capture["bodies"][0]["query"]]
-        assert names[0] == "listObservable"
-        assert "case" in names
-        assert "dedup" in names
-
-    def test_all_entity_kinds_reach_the_query(self, monkeypatch):
-        capture: dict = {}
-        patch_query(monkeypatch, results=[], capture=capture)
-        run(
-            search_open_cases_by_entities(
-                observables(ips=["10.0.0.1"], domains=["evil.test"], urls=["https://e/x"], sha256=[SHA256]),
-                host="win-kvkmd51ggkq",
-                user="Administrator",
-            )
-        )
-        values = capture["bodies"][0]["query"][1]["_in"]["_values"]
-        for expected in ("10.0.0.1", "evil.test", "https://e/x", SHA256, "win-kvkmd51ggkq", "Administrator"):
-            assert expected in values
-
-    def test_entity_values_deduplicated_and_capped(self):
-        obs = observables(ips=["1.1.1.1"] * 5, domains=[f"d{i}.test" for i in range(80)])
-        values = _entity_values(obs, "1.1.1.1", None)
-        assert values.count("1.1.1.1") == 1
-        assert len(values) <= th.MAX_ENTITY_VALUES
-
-    def test_no_entities_gaps_rather_than_querying(self, monkeypatch):
-        """"Nothing to correlate on" must not look like "correlated and found
-        nothing"."""
-        capture: dict = {}
-        patch_query(monkeypatch, results=[], capture=capture)
-        cases, gap = run(search_open_cases_by_entities(Observables(), None, None))
-        assert cases == []
-        assert "no observables, hostname or username" in gap.reason
-        assert capture.get("bodies") is None
-
-
-class TestOpenCaseMapping:
-    def test_maps_a_case_row(self, monkeypatch):
-        patch_query(monkeypatch, results=[[SYNTHETIC_OPEN_CASE], []])
-        cases, gap = run(search_open_cases_by_entities(observables(sha256=[SHA256])))
-        assert gap is None and len(cases) == 1
-        case = cases[0]
-        assert case.case_id == "~100"
-        assert case.case_number == 7
-        assert case.severity == 3
-        assert case.stage == "InProgress"
-        assert case.status == "InProgress"
-        assert f"rule:{RULE_NAME}" in case.tags
-
-    def test_epoch_millis_are_not_read_as_seconds(self, monkeypatch):
-        """TheHive returns epoch MILLISECONDS. Pydantic parses a bare int as
-        seconds, which would date every case to 1970 and silently break any
-        recency reasoning in Stage 3."""
-        patch_query(monkeypatch, results=[[SYNTHETIC_OPEN_CASE], []])
-        cases, _ = run(search_open_cases_by_entities(observables(sha256=[SHA256])))
-        assert cases[0].created_at.year == 2026
-
-    def test_case_observables_are_enriched(self, monkeypatch):
-        patch_query(
-            monkeypatch,
-            results=[[SYNTHETIC_OPEN_CASE], [{"data": SHA256}, {"data": "10.0.0.9"}]],
-        )
-        cases, _ = run(search_open_cases_by_entities(observables(sha256=[SHA256])))
-        assert cases[0].observables == [SHA256, "10.0.0.9"]
-
-    def test_enrichment_failure_still_returns_the_case(self, monkeypatch):
-        calls = {"n": 0}
-
-        async def flaky(body, timeout, name="soc3s"):
-            calls["n"] += 1
-            if calls["n"] == 1:
-                return [SYNTHETIC_OPEN_CASE]
-            raise httpx.ConnectError("enrichment died")
-
-        monkeypatch.setattr(th, "_query", flaky)
-        cases, gap = run(search_open_cases_by_entities(observables(sha256=[SHA256])))
-        assert len(cases) == 1
-        assert cases[0].observables == []
-        assert gap is None
-
-
-
 class TestFailuresProduceGapsNotExceptions:
+    """search_open_cases_by_entities is backed entirely by the similarCases
+    query, so every failure mode below is triggered against that one query,
+    tagged `name="similar-cases"`."""
+
     def test_connection_error(self, monkeypatch):
-        patch_query(monkeypatch, exc=httpx.ConnectError("refused"))
-        cases, gap = run(search_open_cases_by_entities(observables(sha256=[SHA256])))
+        patch_query_by_name(monkeypatch, {"similar-cases": httpx.ConnectError("refused")})
+        cases, gap = run(search_open_cases_by_entities(thehive_alert_id="~4661456"))
         assert cases == []
         assert "Cannot connect to TheHive" in gap.reason
 
@@ -314,11 +168,11 @@ class TestFailuresProduceGapsNotExceptions:
         response = httpx.Response(
             401, text="unauthorized", request=httpx.Request("POST", "http://th/api/v1/query")
         )
-        patch_query(
+        patch_query_by_name(
             monkeypatch,
-            exc=httpx.HTTPStatusError("x", request=response.request, response=response),
+            {"similar-cases": httpx.HTTPStatusError("x", request=response.request, response=response)},
         )
-        _, gap = run(search_open_cases_by_entities(observables(sha256=[SHA256])))
+        _, gap = run(search_open_cases_by_entities(thehive_alert_id="~4661456"))
         assert "HTTP 401 from TheHive" in gap.reason
         assert "unauthorized" in gap.reason
 
@@ -328,65 +182,72 @@ class TestFailuresProduceGapsNotExceptions:
 
         monkeypatch.setattr(th, "_query", slow)
         cases, gap = run(
-            search_open_cases_by_entities(observables(sha256=[SHA256]), timeout=0.05)
+            search_open_cases_by_entities(thehive_alert_id="~4661456", timeout=0.05)
         )
         assert cases == []
         assert "Timeout after 0.05s" in gap.reason
 
-    def test_unexpected_shape(self, monkeypatch):
-        patch_query(monkeypatch, results={"not": "a list"})
-        cases, gap = run(search_open_cases_by_entities(observables(sha256=[SHA256])))
+    def test_missing_alert_id_gaps_without_calling_out(self, monkeypatch):
+        """No alert id to look up shouldn't look like "looked up and found
+        nothing"; the query must never fire."""
+        capture: dict = {}
+        patch_query(monkeypatch, results=[], capture=capture)
+        cases, gap = run(search_open_cases_by_entities(None))
         assert cases == []
-        assert "Unexpected response shape" in gap.reason
+        assert "No thehive_alert_id" in gap.reason
+        assert capture.get("bodies") is None
 
 
-# ===========================================================================
-# similarCases refactor — gap #12, added 2026-08-19
-# ===========================================================================
 class TestSimilarCasesOpenPath:
-    """search_open_cases_by_entities's new primary path, tried first when
-    thehive_alert_id is given."""
+    """search_open_cases_by_entities is backed entirely by TheHive's native
+    similarCases query, with no fallback of any kind. thehive_alert_id is
+    the only input; a missing one produces a Gap rather than a different
+    query."""
 
     def test_real_closed_rows_correctly_excluded(self, monkeypatch, real_similar_cases):
-        """Both real similarCases rows for this alert are stage=='Closed' —
-        the open-cases result must be empty, proving the exclusion side of
-        the stage filter against real data."""
+        """Both real similarCases rows for this alert are stage=='Closed',
+        so the open-cases result should be empty — the exclusion side of
+        the stage filter, against real data."""
         patch_query_by_name(monkeypatch, {"similar-cases": real_similar_cases})
-        cases, gap = run(
-            search_open_cases_by_entities(
-                observables(sha256=[SHA256]), thehive_alert_id="~4661456"
-            )
-        )
+        cases, gap = run(search_open_cases_by_entities(thehive_alert_id="~4661456"))
         assert gap is None
         assert cases == []
 
     def test_synthetic_open_row_included_with_similarity_signal(self, monkeypatch):
-        """Inclusion side of the same filter, plus proves
-        similar_observable_count and the linkedWith-derived observables list
-        both map correctly — real fixture has no open example to test this
-        against."""
+        """Covers the inclusion side of the same filter, and confirms
+        similar_observable_count, the linkedWith-derived observables list,
+        and every other ShallowCase field map correctly. The real fixture
+        has no open example to test this against."""
         patch_query_by_name(
             monkeypatch, {"similar-cases": [SYNTHETIC_SIMILAR_OPEN_ROW]}
         )
-        cases, gap = run(
-            search_open_cases_by_entities(
-                observables(sha256=[SHA256]), thehive_alert_id="~4661456"
-            )
-        )
+        cases, gap = run(search_open_cases_by_entities(thehive_alert_id="~4661456"))
         assert gap is None
         assert len(cases) == 1
-        assert cases[0].case_id == "~100"
-        assert cases[0].similar_observable_count == 3
-        assert cases[0].observables == [SHA256, "evil.test"]
+        case = cases[0]
+        assert case.case_id == "~100"
+        assert case.case_number == 7
+        assert case.severity == 3
+        assert case.stage == "InProgress"
+        assert case.status == "InProgress"
+        assert f"rule:{RULE_NAME}" in case.tags
+        assert case.similar_observable_count == 3
+        assert case.observables == [SHA256, "evil.test"]
+
+    def test_epoch_millis_are_not_read_as_seconds(self, monkeypatch):
+        """TheHive returns epoch milliseconds, but Pydantic parses a bare
+        int as seconds by default, which would date every case to 1970 and
+        break any recency reasoning downstream."""
+        patch_query_by_name(
+            monkeypatch, {"similar-cases": [SYNTHETIC_SIMILAR_OPEN_ROW]}
+        )
+        cases, _ = run(search_open_cases_by_entities(thehive_alert_id="~4661456"))
+        assert cases[0].created_at.year == 2026
 
     def test_similar_cases_query_shape(self, monkeypatch):
         capture: dict = {}
         patch_query_by_name(monkeypatch, {"similar-cases": []}, capture=capture)
-        run(
-            search_open_cases_by_entities(
-                observables(sha256=[SHA256]), thehive_alert_id="~4661456"
-            )
-        )
+        run(search_open_cases_by_entities(thehive_alert_id="~4661456"))
         body = capture["bodies"][capture["names"].index("similar-cases")]
         assert body == {
             "query": [
@@ -395,52 +256,16 @@ class TestSimilarCasesOpenPath:
             ]
         }
 
-    def test_missing_alert_id_never_calls_similar_cases(self, monkeypatch):
-        capture: dict = {}
-        patch_query(monkeypatch, results=[], capture=capture)
-        run(search_open_cases_by_entities(observables(sha256=[SHA256])))
-        assert "similar-cases" not in capture.get("names", [])
 
-    def test_similar_cases_failure_falls_back_to_old_query(self, monkeypatch):
-        """thehive_alert_id given, but the similarCases call itself fails —
-        must fall through to the untouched old entity-value query rather
-        than propagating the failure or returning an empty result."""
-
-        async def fake_query(body, timeout, name="soc3s"):
-            if name == "similar-cases":
-                raise httpx.ConnectError("similarity engine down")
-            return [SYNTHETIC_OPEN_CASE] if name == "open-cases-by-entity" else []
-
-        monkeypatch.setattr(th, "_query", fake_query)
-        cases, gap = run(
-            search_open_cases_by_entities(
-                observables(sha256=[SHA256]), thehive_alert_id="~4661456"
-            )
-        )
-        assert gap is None
-        assert len(cases) == 1
-        assert cases[0].case_id == "~100"
-        # Old path's case came back with no similarity signal — correctly None.
-        assert cases[0].similar_observable_count is None
-
-
-# ===========================================================================
-# get_full_alert_with_analysis — the stock two-call path (2026-08-13)
-# ===========================================================================
 class TestGetFullAlertWithAnalysis:
-    """REAL payloads from alert `~4661456`, captured 2026-08-13 from TheHive
-    5.7.5-1 at 172.20.24.228 — richer than the alert used elsewhere in this
-    fixture, since it carries genuine VirusTotal reports (not just OpenCTI
-    "Not found") alongside OpenCTI's.
+    """Uses payloads from a real TheHive alert that's richer than the one
+    used elsewhere in this fixture, since it carries VirusTotal reports
+    alongside OpenCTI's rather than only OpenCTI's "Not found".
 
-    This function used to call a custom `getAlertWithObservables` Function
-    because TheHive 5.7.3's external API silently dropped
-    `extraData:["reports"]`. Re-verified 2026-08-13: the Function is gone
-    (404), but the stock `getAlert` -> `observables` -> `page` projection now
-    returns `reports[analyzer].taxonomies` directly with no `extraData`
-    needed, so the function was rewritten to two concurrent stock queries
-    instead of re-registering the Function. See the function's own docstring
-    in tools/thehive.py.
+    The stock `getAlert` -> `observables` -> `page` projection returns
+    `reports[analyzer].taxonomies` directly with no extra parameters needed:
+    two concurrent stock queries, no custom server-side function required.
+    See the function's own docstring in tools/thehive.py.
     """
 
     def test_real_payload_yields_alert_and_observables(self, monkeypatch, real):
@@ -454,8 +279,8 @@ class TestGetFullAlertWithAnalysis:
         assert len(hive_alert["observables"]) == 4
 
     def test_taxonomies_survive_into_the_hive_alert(self, monkeypatch, real):
-        """The whole point of the rewrite: reports[analyzer].taxonomies must
-        still reach alert_builder unchanged, now via the stock query."""
+        """reports[analyzer].taxonomies must reach alert_builder unchanged
+        via the stock query."""
         patch_query_by_name(
             monkeypatch,
             {"alert-detail": real["alert_detail"], "alert-observables": real["alert_observables"]},
@@ -487,8 +312,8 @@ class TestGetFullAlertWithAnalysis:
         assert "no alert" in gap.reason.lower()
 
     def test_observables_fetch_failure_still_returns_the_alert(self, monkeypatch):
-        """A partial failure — alert fetched fine, observables query broke —
-        must not throw the alert away too."""
+        """A partial failure (alert fetched fine, observables query broke)
+        shouldn't discard the alert too."""
         patch_query_by_name(
             monkeypatch,
             {
@@ -526,12 +351,12 @@ class TestGetFullAlertWithAnalysis:
 
 
 class TestFetchCaseObservablesWithType:
-    """New in the 2026-08-23 Stage 4 build (CLAUDE.md) — Stage 4's read-side
-    fetch of a merge target case's existing observables. Same
-    getCase -> observables -> page query `_fetch_case_observables` already
-    proves live, but keeps dataType/tags instead of collapsing to bare
-    value strings, and follows the standard NEVER RAISES + Gap contract
-    every other public function in this file uses."""
+    """The read-side fetch of a merge target case's existing observables,
+    used before writing actionable observables. Uses the same
+    getCase -> observables -> page query as `_fetch_case_observables`, but
+    keeps dataType/tags instead of collapsing to bare value strings, and
+    follows the same never-raises-plus-Gap contract as every other public
+    function in this file."""
 
     def test_maps_datatype_value_and_tags(self, monkeypatch):
         patch_query(

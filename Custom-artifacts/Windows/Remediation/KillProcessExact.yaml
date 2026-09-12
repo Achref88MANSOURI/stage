@@ -1,0 +1,75 @@
+name: Custom.Windows.Remediation.KillProcessExact
+author: SOC-3s (adapted from Windows.Remediation.Process by Matt Green - @mgreen27)
+description: |
+  Kills a Windows process using EXACT match on executable path (required) and
+  optionally an exact PID (if supplied) as a secondary narrowing filter.
+
+  Deliberately uses VQL equality (=) instead of regex match (=~) for both
+  fields. Windows paths contain backslashes and dots, both of which are
+  regex metacharacters -- matching them with =~ requires careful, layered
+  escaping (VQL string escaping, then regex escaping) that is easy to get
+  subtly wrong in an automated pipeline. Exact equality removes that
+  escaping/injection risk class entirely.
+
+  TargetExe is compared case-insensitively (via upcase()) since Windows
+  paths are case-insensitive by OS convention even though this comparison
+  itself is a plain string compare, not a regex.
+
+  TargetPid is optional. 0 means "do not check PID" -- path match alone is
+  sufficient, since it is evaluated against the LIVE process list at
+  execution time (inherently current, unlike a PID captured earlier which
+  may have been reused by the OS in the interim). Supplying a real PID adds
+  a secondary narrowing check but is never required for a match.
+
+  WARNING: dangerous content. No guardrails beyond exact-match + explicit
+  ReallyDoIt flag. Caller (the Cortex responder) is responsible for
+  supplying a verified, exact executable path sourced from a typed TheHive
+  observable -- never from free text.
+
+type: CLIENT
+
+parameters:
+  - name: TargetExe
+    description: >
+      Full, exact executable path to match (case-insensitive). Example:
+      C:\Windows\Temp\malware.exe
+    type: string
+
+  - name: TargetPid
+    description: >
+      Exact PID to additionally require as a match. 0 = do not check PID
+      (path match alone is sufficient).
+    type: int
+    default: 0
+
+  - name: ReallyDoIt
+    description: >
+      Must be explicitly TRUE to actually kill the process. FALSE (default)
+      performs a dry-run / scope-only pass and reports what WOULD have been
+      killed, without killing anything.
+    type: bool
+    default: FALSE
+
+sources:
+  - precondition:
+      SELECT OS FROM info() WHERE OS = 'windows'
+
+    query: |
+      -- Never target Velociraptor's own process, regardless of match.
+      LET me = SELECT Pid FROM pslist(pid=getpid())
+
+      -- Exact-match candidates. Exe path is always required and compared
+      -- case-insensitively. Pid is an optional secondary filter -- if
+      -- TargetPid is 0 the PID check is skipped entirely.
+      LET targets = SELECT Name AS ProcessName, Exe, CommandLine, Pid
+        FROM pslist()
+        WHERE upcase(string=Exe) = upcase(string=TargetExe)
+          AND (TargetPid = 0 OR Pid = TargetPid)
+          AND NOT Pid IN me.Pid
+
+      SELECT ProcessName, Exe, CommandLine, Pid,
+        if(condition = ReallyDoIt,
+           then = pskill(pid = Pid),
+           else = "DRY_RUN - not killed, ReallyDoIt was FALSE"
+        ) AS Result
+      FROM targets

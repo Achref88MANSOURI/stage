@@ -1,0 +1,69 @@
+{
+  "name": "VR_BlockIP",
+  "version": "1.0",
+  "author": "TrustShield / SOC-3s",
+  "url": "",
+  "license": "AGPL-V3",
+  "description": "Block a specific IP address (inbound + outbound) on a managed Windows endpoint via Velociraptor and Windows Firewall (netsh advfirewall). Triggered on an 'ip' dataType observable. Requires a 'hostname' or 'endpoint-ip' observable on the parent case. No internet connection required on the endpoint — all logic is self-contained in Custom.Windows.Remediation.BlockIPExact.",
+  "dataTypeList": ["thehive:case_artifact"],
+  "command": "Velociraptor/vr_blockip.py",
+  "baseConfig": "VR_BlockIP",
+  "config": {
+    "service": "VR_BlockIP"
+  },
+  "configurationItems": [
+    {
+      "name": "velociraptor_api_config",
+      "description": "Path to the Velociraptor API client config YAML on the Cortex host (e.g. /opt/cortex/velociraptor/api.config.yaml).",
+      "type": "string",
+      "multi": false,
+      "required": true
+    },
+    {
+      "name": "thehive_url",
+      "description": "TheHive base URL (e.g. http://172.20.24.228:9000).",
+      "type": "string",
+      "multi": false,
+      "required": true
+    },
+    {
+      "name": "thehive_apikey",
+      "description": "TheHive API key for the Cortex service account.",
+      "type": "string",
+      "multi": false,
+      "required": true
+    },
+    {
+      "name": "rule_name",
+      "description": "Prefix for Windows Firewall rule names. Final names: '<rule_name>-in-<IP>' and '<rule_name>-out-<IP>'. Default: VeloBlockIP.",
+      "type": "string",
+      "multi": false,
+      "required": false,
+      "defaultValue": "VeloBlockIP"
+    },
+    {
+      "name": "really_do_it",
+      "description": "Set to true to actually modify the firewall. false = dry-run: the artifact reports what would happen without touching any rules.",
+      "type": "boolean",
+      "multi": false,
+      "required": false,
+      "defaultValue": false
+    },
+    {
+      "name": "poll_timeout_seconds",
+      "description": "Maximum seconds to wait for the Velociraptor flow to complete. Default: 120.",
+      "type": "number",
+      "multi": false,
+      "required": false,
+      "defaultValue": 120
+    },
+    {
+      "name": "poll_interval_seconds",
+      "description": "Polling interval in seconds. Default: 5.",
+      "type": "number",
+      "multi": false,
+      "required": false,
+      "defaultValue": 5
+    }
+  ]
+}
