@@ -1,4 +1,4 @@
-# SOC-3s — AI-Assisted Triage Service
+# SOC Automation Pipeline — AI-Assisted Triage Service
 
 AI-assisted triage service for Security Onion alerts. Takes an already-enriched TheHive
 alert, gathers additional context, runs one LLM call to produce a triage verdict, and
